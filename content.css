@@ -124,6 +124,8 @@
     box-shadow: 0 1px 4px rgba(37,99,235,0.30);
 }
 .hvt-btn-primary:hover { background: #1d4ed8; border-color: #1d4ed8; }
+.hvt-btn-danger { background: #dc2626; border-color: #dc2626; color: #fff; }
+.hvt-btn-danger:hover { background: #b91c1c; border-color: #b91c1c; }
 .hvt-btn-sm { padding: 4px 10px; font-size: 13px; }
 
 /* ── Filters (slightly gray – visually distinct from table area) ──────── */
@@ -260,7 +262,8 @@
 /* ── Column widths ──────────────────────────────────────────────────────── */
 .c-num     { width: 36px;  text-align: center; color: #cbd5e1 !important; font-size: 13px; }
 .c-status  { width: 44px;  text-align: center; }
-.c-country { width: 92px; }
+.c-country { width: 72px; }
+.c-flag    { width: 36px;  text-align: center; font-size: 18px; }
 .c-gender  { width: 48px;  text-align: center; }
 .c-name    { width: 250px; font-weight: 600; color: #0f172a !important; }
 .c-id      { width: 115px; font-family: 'Menlo','Consolas',monospace; font-size: 14px; color: #94a3b8 !important; cursor: pointer; }
@@ -420,7 +423,7 @@ td.hvt-copied { animation: hvt-copy-flash 0.55s ease-out; }
 
 /* tbody td: pointer cursor on copyable cells (title attr provides tooltip) */
 #hvt-tbody td { cursor: default; }
-#hvt-tbody td:not(.c-play):not(.c-notes):not(.c-status):not(.c-num) { cursor: pointer; }
+#hvt-tbody td:not(.c-play):not(.c-notes):not(.c-status):not(.c-num):not(.c-flag) { cursor: pointer; }
 
 /* Audio error button state */
 .hvt-play-btn[data-errored="1"] {

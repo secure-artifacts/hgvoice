@@ -25,6 +25,8 @@
     let showMissingOnly = false;
     let isMinimized = false;
     let fetchInProgress = false;
+    let fetchCancelled  = false;
+    let fetchPaused     = false;
     let downloadInProgress = false;
     let downloadCancelled  = false;
     let activeFilterMode = 'dropdown'; // 'paste' | 'dropdown' — last-applied wins
@@ -80,15 +82,33 @@
     }
 
     // ─── Fetch & merge ────────────────────────────────────────────────────────
-    async function fetchAllVoices(onProgress) {
-        for (const id in db.voices) db.voices[id].existsOnHeygen = false;
+    // langFilter : 语言筛选值（如 'English'）；空字符串 = 不限语言（拉全量）
+    // localeFilter: 地区筛选值（如 'en-US'）；客户端过滤，空 = 不限
+    async function fetchAllVoices(onProgress, langFilter, localeFilter) {
+        // 只把本次目标范围内的声音先标为不存在，其它语言数据保留
+        const filterLang   = (langFilter   || '').toLowerCase();
+        const filterLocale = (localeFilter || '').toLowerCase();
+
+        for (const id in db.voices) {
+            const v = db.voices[id];
+            const langMatch   = !filterLang   || (v.language || '').toLowerCase() === filterLang;
+            const localeMatch = !filterLocale || (v.locale   || '').toLowerCase() === filterLocale;
+            if (langMatch && localeMatch) v.existsOnHeygen = false;
+        }
 
         let fetched = 0;
         let cursor  = null;
 
         do {
-            const p = new URLSearchParams({ limit: '50', language: LANGUAGE });
-            if (cursor) p.set('cursor', cursor);
+            // 暂停：等待直到继续或终止
+            while (fetchPaused && !fetchCancelled) {
+                await new Promise(r => setTimeout(r, 200));
+            }
+            if (fetchCancelled) break;
+
+            const p = new URLSearchParams({ limit: '50' });
+            if (langFilter) p.set('language', langFilter);
+            if (cursor)     p.set('cursor',   cursor);
             if (onProgress) onProgress(`获取中… 已加载 ${fetched} 条`);
 
             const data = await heygenApi('/v2/public_voices?' + p);
@@ -96,13 +116,16 @@
 
             for (const v of list) {
                 if (!v.voice_id) continue;
+                // 地区客户端过滤
+                if (filterLocale && (v.locale || '').toLowerCase() !== filterLocale) continue;
+
                 const id       = v.voice_id;
                 const existing = db.voices[id] || {};
                 db.voices[id] = {
                     voice_id:      id,
                     display_name:  v.display_name  || existing.display_name  || '',
                     gender:        v.gender         || existing.gender         || '',
-                    language:      v.language       || LANGUAGE,
+                    language:      v.language       || langFilter || LANGUAGE,
                     locale:        v.locale         || existing.locale         || '',
                     labels:        v.labels         || existing.labels         || [],
                     description:   v.description    || existing.description    || '',
@@ -222,7 +245,7 @@
     function localeToFlag(locale) {
         if (!locale) return '';
         const cc = locale.split('-').pop().toUpperCase();
-        if (cc.length !== 2 || !/^[A-Z]{2}$/.test(cc)) return '';
+        if (cc.length !== 2 || !/^[A-Z]{2}$/.test(cc)) return '🌐';
         return [...cc].map(c => String.fromCodePoint(0x1F1E6 + c.charCodeAt(0) - 65)).join('');
     }
 
@@ -339,8 +362,8 @@
         while (ageSel.options.length    > 1) ageSel.remove(1);
         while (tagSel && tagSel.options.length > 1) tagSel.remove(1);
         populateFilters();
-        langSel.value   = prevLang   || LANGUAGE;
-        localeSel.value = prevLocale || DEFAULT_LOCALE;
+        langSel.value   = prevLang;
+        localeSel.value = prevLocale;
         ageSel.value    = prevAge;
         if (tagSel) tagSel.value = prevTag;
     }
@@ -431,7 +454,7 @@
         if (table) table.classList.toggle('hvt-no-desc', !showDesc);
 
         if (list.length === 0) {
-            tbody.innerHTML = `<tr><td colspan="10" class="hvt-empty">
+            tbody.innerHTML = `<tr><td colspan="11" class="hvt-empty">
                 <span class="hvt-empty-icon">${totalVoices === 0 ? '🎙' : '🔍'}</span>
                 ${totalVoices === 0 ? '暂无人声数据，请点击上方「获取/更新人声」按钮' : '没有符合条件的人声'}
             </td></tr>`;
@@ -464,7 +487,8 @@
             tr.innerHTML = `
                 <td class="c-num">${i + 1}</td>
                 <td class="c-status" title="${statusTitle}">${statusIcon}</td>
-                <td class="c-country" title="${esc(localeCode)}（双击复制）">${flag} ${esc(localeCode)}</td>
+                <td class="c-country" title="${esc(localeCode)}（双击复制）">${esc(localeCode)}</td>
+                <td class="c-flag" title="${esc(localeCode)}">${flag}</td>
                 <td class="c-gender"><span class="${genderClass}">${genderIcon}</span></td>
                 <td class="c-name" title="${esc(v.display_name)}（双击复制）">${esc(v.display_name || '—')}</td>
                 <td class="c-id" title="${esc(v.voice_id)}（双击复制完整 ID）" data-copy="${esc(v.voice_id)}">${esc(shortId)}</td>
@@ -593,6 +617,8 @@
     <span id="hvt-title">🎙 Heygen Helper T3 / Voice Tester</span>
     <div id="hvt-header-btns">
       <button id="hvt-btn-fetch"    class="hvt-btn hvt-btn-primary">获取 / 更新人声</button>
+      <button id="hvt-btn-fetch-pause"  class="hvt-btn" style="display:none">暂停</button>
+      <button id="hvt-btn-fetch-abort"  class="hvt-btn hvt-btn-danger" style="display:none">终止</button>
       <button id="hvt-btn-dl-mp3"   class="hvt-btn" title="下载当前列表所有 MP3，以 Voice ID 命名">⬇ 下载 MP3</button>
       <button id="hvt-btn-export"   class="hvt-btn">⬇ 导出</button>
       <button id="hvt-btn-import"   class="hvt-btn">⬆ 导入</button>
@@ -636,15 +662,16 @@
       <thead>
         <tr>
           <th class="c-num">#</th>
-          <th class="c-status">状态</th>
-          <th class="c-country">国家 / 地区</th>
-          <th class="c-gender">性别</th>
-          <th class="c-name">人声名称</th>
-          <th class="c-id">人声ID</th>
-          <th class="c-combo">人声名称/人声ID</th>
-          <th class="c-desc">人声介绍</th>
-          <th class="c-tags">属性标签</th>
-          <th class="c-notes">备注</th>
+          <th class="c-status" data-col="c-status" title="双击复制整列">状态</th>
+          <th class="c-country" data-col="c-country" title="双击复制整列">国家 / 地区</th>
+          <th class="c-flag">国旗</th>
+          <th class="c-gender" data-col="c-gender" title="双击复制整列">性别</th>
+          <th class="c-name" data-col="c-name" title="双击复制整列">人声名称</th>
+          <th class="c-id" data-col="c-id" title="双击复制整列">人声ID</th>
+          <th class="c-combo" data-col="c-combo" title="双击复制整列">人声名称/人声ID</th>
+          <th class="c-desc" data-col="c-desc" title="双击复制整列">人声介绍</th>
+          <th class="c-tags" data-col="c-tags" title="双击复制整列">属性标签</th>
+          <th class="c-notes" data-col="c-notes" title="双击复制整列">备注</th>
           <th class="c-play">试听</th>
         </tr>
       </thead>
@@ -677,6 +704,38 @@
 
     // ─── Event binding ────────────────────────────────────────────────────────
     function bindEvents() {
+        // Double-click table header → copy entire column data
+        document.querySelector('#hvt-table thead tr').addEventListener('dblclick', e => {
+            const th = e.target.closest('th[data-col]');
+            if (!th) return;
+            const col = th.dataset.col;
+            const rows = document.querySelectorAll('#hvt-tbody tr');
+            if (!rows.length) return;
+
+            const values = [];
+            rows.forEach(tr => {
+                const td = tr.querySelector(`td.${col}`);
+                if (!td) return;
+                // c-id / c-combo: use data-copy (full value), others: text / input value
+                if (col === 'c-id' || col === 'c-combo') {
+                    values.push(td.dataset.copy || td.textContent.trim());
+                } else if (col === 'c-notes') {
+                    const inp = td.querySelector('input');
+                    values.push(inp ? inp.value : '');
+                } else if (col === 'c-tags') {
+                    values.push([...td.querySelectorAll('.hvt-tag')].map(t => t.textContent.trim()).join(', '));
+                } else {
+                    values.push(td.textContent.trim());
+                }
+            });
+
+            navigator.clipboard.writeText(values.join('\n')).then(() => {
+                showToast(`✅ 已复制「${th.textContent.trim()}」列 ${values.length} 条数据`, 'success', 2000);
+            }).catch(() => {
+                showToast('复制失败，请检查浏览器权限', 'error');
+            });
+        });
+
         document.getElementById('hvt-fab').addEventListener('click', () => {
             const root = document.getElementById('hvt-root');
             isMinimized = !isMinimized;
@@ -773,44 +832,89 @@
                 downloadCancelled = true;
                 return;
             }
-            const voices = getFilteredVoices();
-            if (voices.length === 0) { showToast('当前列表没有人声', 'error'); return; }
+            const fLang   = (document.getElementById('hvt-f-lang')?.value   || '').toLowerCase();
+            const fLocale = (document.getElementById('hvt-f-locale')?.value || '').toLowerCase();
+            let voices = Object.values(db.voices);
+            if (fLang)   voices = voices.filter(v => (v.language || '').toLowerCase() === fLang);
+            if (fLocale) voices = voices.filter(v => (v.locale   || '').toLowerCase() === fLocale);
+            voices.sort((a, b) => (a.display_name || '').localeCompare(b.display_name || ''));
+            if (voices.length === 0) { showToast('当前范围没有人声', 'error'); return; }
+            const scopeLabel = [fLang, fLocale].filter(Boolean).join(' / ') || '全部';
             if (voices.length > 50) {
-                if (!confirm(`当前列表有 ${voices.length} 条人声，将下载 MP3 文件，继续？`)) return;
+                if (!confirm(`将下载 ${scopeLabel} 范围内 ${voices.length} 个人声的 MP3，继续？`)) return;
             }
             downloadMp3List(voices);
         });
 
-        document.getElementById('hvt-btn-fetch').addEventListener('click', async () => {
+        const btnFetch = document.getElementById('hvt-btn-fetch');
+        const btnPause = document.getElementById('hvt-btn-fetch-pause');
+        const btnAbort = document.getElementById('hvt-btn-fetch-abort');
+
+        function showFetchControls(show) {
+            btnFetch.style.display = show ? 'none'  : '';
+            btnPause.style.display = show ? ''      : 'none';
+            btnAbort.style.display = show ? ''      : 'none';
+            if (!show) {
+                btnPause.textContent = '暂停';
+                btnAbort.disabled    = false;
+            }
+        }
+
+        btnFetch.addEventListener('click', async () => {
             if (fetchInProgress) return;
+
             fetchInProgress = true;
-            const btn      = document.getElementById('hvt-btn-fetch');
+            fetchCancelled  = false;
+            fetchPaused     = false;
+
             const progress = document.getElementById('hvt-progress');
-            btn.disabled   = true;
-            btn.classList.add('hvt-loading');
-            btn.textContent = '获取中…';
+            const langFilter   = document.getElementById('hvt-f-lang')?.value   || '';
+            const localeFilter = document.getElementById('hvt-f-locale')?.value || '';
+            const scopeLabel   = [langFilter, localeFilter].filter(Boolean).join(' / ') || '全部';
+
+            showFetchControls(true);
+            btnFetch.classList.add('hvt-loading');
             if (progress) progress.textContent = '';
             try {
                 const count = await fetchAllVoices((msg) => {
                     if (progress) progress.textContent = msg;
                     const stats = document.getElementById('hvt-stats');
                     if (stats) stats.textContent = msg;
-                });
+                }, langFilter, localeFilter);
                 refreshFilters();
                 renderTable();
                 updateSyncInfo();
                 if (progress) progress.textContent = '';
-                showToast(`✅ 同步完成，共 ${count} 个人声`, 'success', 3000);
+                if (fetchCancelled) {
+                    showToast(`已终止，已加载 ${count} 个人声`, 'info', 3000);
+                } else {
+                    showToast(`✅ 同步完成（${scopeLabel}），共 ${count} 个人声`, 'success', 3000);
+                }
             } catch (e) {
                 console.error('[HVT] fetch error:', e);
                 if (progress) progress.textContent = '获取失败';
                 showToast('获取失败: ' + e.message, 'error', 4000);
             } finally {
                 fetchInProgress = false;
-                btn.disabled    = false;
-                btn.classList.remove('hvt-loading');
-                btn.textContent = '获取 / 更新人声';
+                fetchCancelled  = false;
+                fetchPaused     = false;
+                btnFetch.classList.remove('hvt-loading');
+                showFetchControls(false);
             }
+        });
+
+        btnPause.addEventListener('click', () => {
+            if (!fetchInProgress) return;
+            fetchPaused = !fetchPaused;
+            btnPause.textContent = fetchPaused ? '继续' : '暂停';
+        });
+
+        btnAbort.addEventListener('click', () => {
+            if (!fetchInProgress) return;
+            fetchCancelled = true;
+            fetchPaused    = false;   // 如果处于暂停中，解除暂停让循环能检测到终止
+            btnAbort.disabled   = true;
+            btnPause.textContent = '暂停';
         });
 
         document.getElementById('hvt-btn-export').addEventListener('click', () => {
