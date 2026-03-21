@@ -5,7 +5,7 @@
 
     // ─── Constants ────────────────────────────────────────────────────────────
     const STORE_KEY = 'hvt_data_v1';
-    const API_BASE  = 'https://api2.heygen.com';
+    const API_BASE = 'https://api2.heygen.com';
 
     // ── 语言 / 地区设置（按需修改，供不同地区用户使用）──────────────────────
     // 同时用于：① 拉取人声 API 参数  ② 启动后语言筛选默认值
@@ -22,13 +22,14 @@
     let playingId = null;
     let selectedVoiceId = null; // row highlighted by click in paste-filter mode
     let pasteFilterIds = null; // null = off, Set = filter to these IDs
+    let pasteFilterOrder = null; // Map<id, index> — preserves paste input order
     let showMissingOnly = false;
     let isMinimized = false;
     let fetchInProgress = false;
-    let fetchCancelled  = false;
-    let fetchPaused     = false;
+    let fetchCancelled = false;
+    let fetchPaused = false;
     let downloadInProgress = false;
-    let downloadCancelled  = false;
+    let downloadCancelled = false;
     let activeFilterMode = 'dropdown'; // 'paste' | 'dropdown' — last-applied wins
 
     // ─── Storage ──────────────────────────────────────────────────────────────
@@ -36,7 +37,7 @@
         try {
             const raw = localStorage.getItem(STORE_KEY);
             if (raw) db = JSON.parse(raw);
-        } catch (e) {}
+        } catch (e) { }
         if (!db || typeof db !== 'object') db = { voices: {}, lastSync: null };
         if (!db.voices) db.voices = {};
     }
@@ -86,18 +87,18 @@
     // localeFilter: 地区筛选值（如 'en-US'）；客户端过滤，空 = 不限
     async function fetchAllVoices(onProgress, langFilter, localeFilter) {
         // 只把本次目标范围内的声音先标为不存在，其它语言数据保留
-        const filterLang   = (langFilter   || '').toLowerCase();
+        const filterLang = (langFilter || '').toLowerCase();
         const filterLocale = (localeFilter || '').toLowerCase();
 
         for (const id in db.voices) {
             const v = db.voices[id];
-            const langMatch   = !filterLang   || (v.language || '').toLowerCase() === filterLang;
-            const localeMatch = !filterLocale || (v.locale   || '').toLowerCase() === filterLocale;
+            const langMatch = !filterLang || (v.language || '').toLowerCase() === filterLang;
+            const localeMatch = !filterLocale || (v.locale || '').toLowerCase() === filterLocale;
             if (langMatch && localeMatch) v.existsOnHeygen = false;
         }
 
         let fetched = 0;
-        let cursor  = null;
+        let cursor = null;
 
         do {
             // 暂停：等待直到继续或终止
@@ -108,7 +109,7 @@
 
             const p = new URLSearchParams({ limit: '50' });
             if (langFilter) p.set('language', langFilter);
-            if (cursor)     p.set('cursor',   cursor);
+            if (cursor) p.set('cursor', cursor);
             if (onProgress) onProgress(`获取中… 已加载 ${fetched} 条`);
 
             const data = await heygenApi('/v2/public_voices?' + p);
@@ -119,22 +120,22 @@
                 // 地区客户端过滤
                 if (filterLocale && (v.locale || '').toLowerCase() !== filterLocale) continue;
 
-                const id       = v.voice_id;
+                const id = v.voice_id;
                 const existing = db.voices[id] || {};
                 db.voices[id] = {
-                    voice_id:      id,
-                    display_name:  v.display_name  || existing.display_name  || '',
-                    gender:        v.gender         || existing.gender         || '',
-                    language:      v.language       || langFilter || LANGUAGE,
-                    locale:        v.locale         || existing.locale         || '',
-                    labels:        v.labels         || existing.labels         || [],
-                    description:   v.description    || existing.description    || '',
+                    voice_id: id,
+                    display_name: v.display_name || existing.display_name || '',
+                    gender: v.gender || existing.gender || '',
+                    language: v.language || langFilter || LANGUAGE,
+                    locale: v.locale || existing.locale || '',
+                    labels: v.labels || existing.labels || [],
+                    description: v.description || existing.description || '',
                     preview_audio: (v.preview && v.preview.movio) || existing.preview_audio || '',
-                    age:           normalizeAge(v.age || existing.age || ''),
-                    notes:         existing.notes || '',
+                    age: normalizeAge(v.age || existing.age || ''),
+                    notes: existing.notes || '',
                     existsOnHeygen: true,
-                    lastSeen:      Date.now(),
-                    firstAdded:    existing.firstAdded || Date.now(),
+                    lastSeen: Date.now(),
+                    firstAdded: existing.firstAdded || Date.now(),
                 };
                 fetched++;
             }
@@ -150,7 +151,7 @@
 
     // ─── Audio ────────────────────────────────────────────────────────────────
     function stopAudio() {
-        if (audioEl) { try { audioEl.pause(); } catch(e){} audioEl.src = ''; audioEl = null; }
+        if (audioEl) { try { audioEl.pause(); } catch (e) { } audioEl.src = ''; audioEl = null; }
         if (playingId) {
             const btn = document.querySelector(`.hvt-play-btn[data-play-id="${CSS.escape(playingId)}"]`);
             if (btn) btn.dataset.playing = '';
@@ -188,8 +189,8 @@
         if (withAudio.length === 0) { showToast('当前列表没有可下载的音频', 'error'); return; }
 
         downloadInProgress = true;
-        downloadCancelled  = false;
-        const dlBtn     = document.getElementById('hvt-btn-dl-mp3');
+        downloadCancelled = false;
+        const dlBtn = document.getElementById('hvt-btn-dl-mp3');
         const progressEl = document.getElementById('hvt-progress');
         if (dlBtn) { dlBtn.textContent = '⏹ 停止下载'; dlBtn.classList.add('hvt-btn-stop'); }
 
@@ -199,11 +200,11 @@
             if (downloadCancelled) break;
             if (progressEl) progressEl.textContent = `下载中 ${done + 1} / ${withAudio.length}…`;
             try {
-                const res  = await fetch(v.preview_audio);
+                const res = await fetch(v.preview_audio);
                 const blob = await res.blob();
-                const url  = URL.createObjectURL(blob);
-                const a    = document.createElement('a');
-                a.href     = url;
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
                 a.download = `${v.voice_id}.mp3`;
                 document.body.appendChild(a);
                 a.click();
@@ -218,7 +219,7 @@
         }
 
         downloadInProgress = false;
-        if (dlBtn)     { dlBtn.textContent = '⬇ 下载 MP3'; dlBtn.classList.remove('hvt-btn-stop'); }
+        if (dlBtn) { dlBtn.textContent = '⬇ 下载 MP3'; dlBtn.classList.remove('hvt-btn-stop'); }
         if (progressEl) progressEl.textContent = '';
 
         if (downloadCancelled) {
@@ -267,29 +268,32 @@
 
     // ─── Filters ──────────────────────────────────────────────────────────────
     function getFilteredVoices() {
-        const q       = (document.getElementById('hvt-search')?.value  || '').toLowerCase().trim();
+        const q = (document.getElementById('hvt-search')?.value || '').toLowerCase().trim();
         const fLocale = (document.getElementById('hvt-f-locale')?.value || '').toLowerCase();
         const fGender = (document.getElementById('hvt-f-gender')?.value || '').toLowerCase();
-        const fLang   = (document.getElementById('hvt-f-lang')?.value   || '').toLowerCase();
-        const fAge    = (document.getElementById('hvt-f-age')?.value    || '').toLowerCase();
-        const fTag    = (document.getElementById('hvt-f-tag')?.value    || '').toLowerCase();
+        const fLang = (document.getElementById('hvt-f-lang')?.value || '').toLowerCase();
+        const fAge = (document.getElementById('hvt-f-age')?.value || '').toLowerCase();
+        const fTag = (document.getElementById('hvt-f-tag')?.value || '').toLowerCase();
 
         let list = Object.values(db.voices);
 
         if (pasteFilterIds !== null && activeFilterMode === 'paste') {
-            // Paste filter active (and was applied last): only show matched IDs, skip all other filters
+            // Paste filter active: only show matched IDs, sorted by input order
             list = list.filter(v => pasteFilterIds.has((v.voice_id || '').toLowerCase()));
-            list.sort((a, b) => {
-                if (a.existsOnHeygen !== b.existsOnHeygen) return a.existsOnHeygen ? -1 : 1;
-                return (a.display_name || '').localeCompare(b.display_name || '');
-            });
+            if (pasteFilterOrder) {
+                list.sort((a, b) => {
+                    const ai = pasteFilterOrder.get((a.voice_id || '').toLowerCase()) ?? Infinity;
+                    const bi = pasteFilterOrder.get((b.voice_id || '').toLowerCase()) ?? Infinity;
+                    return ai - bi;
+                });
+            }
             return list;
         }
 
         if (showMissingOnly) { list = list.filter(v => v.existsOnHeygen === false); return list; }
-        if (fLang)   list = list.filter(v => (v.language || '').toLowerCase() === fLang);
-        if (fLocale) list = list.filter(v => (v.locale   || '').toLowerCase() === fLocale);
-        if (fGender) list = list.filter(v => (v.gender   || '').toLowerCase() === fGender);
+        if (fLang) list = list.filter(v => (v.language || '').toLowerCase() === fLang);
+        if (fLocale) list = list.filter(v => (v.locale || '').toLowerCase() === fLocale);
+        if (fGender) list = list.filter(v => (v.gender || '').toLowerCase() === fGender);
         if (fAge) list = list.filter(v => {
             const hay = ((v.age || '') + ' ' + (v.labels || []).join(' ')).toLowerCase();
             return hay.includes(fAge);
@@ -300,10 +304,10 @@
 
         if (q) {
             list = list.filter(v => {
-                const name  = (v.display_name || '').toLowerCase();
-                const id    = (v.voice_id     || '').toLowerCase();
-                const tags  = (v.labels || []).join(' ').toLowerCase();
-                const notes = (v.notes        || '').toLowerCase();
+                const name = (v.display_name || '').toLowerCase();
+                const id = (v.voice_id || '').toLowerCase();
+                const tags = (v.labels || []).join(' ').toLowerCase();
+                const notes = (v.notes || '').toLowerCase();
                 return name.includes(q) || id.includes(q) || tags.includes(q) || notes.includes(q);
             });
         }
@@ -318,8 +322,8 @@
 
     // ─── Populate filter dropdowns ────────────────────────────────────────────
     function populateFilters() {
-        const voices  = Object.values(db.voices);
-        const langs   = [...new Set(voices.map(v => v.language).filter(Boolean))].sort();
+        const voices = Object.values(db.voices);
+        const langs = [...new Set(voices.map(v => v.language).filter(Boolean))].sort();
         const locales = [...new Set(voices.map(v => v.locale).filter(Boolean))].sort();
 
         // Collect ages: from v.age + age-related labels, normalized to Title Case
@@ -337,10 +341,10 @@
         const allTags = new Set();
         voices.forEach(v => (v.labels || []).forEach(l => { if (l.trim()) allTags.add(normalizeAge(l.trim())); }));
 
-        const langSel   = document.getElementById('hvt-f-lang');
+        const langSel = document.getElementById('hvt-f-lang');
         const localeSel = document.getElementById('hvt-f-locale');
-        const ageSel    = document.getElementById('hvt-f-age');
-        const tagSel    = document.getElementById('hvt-f-tag');
+        const ageSel = document.getElementById('hvt-f-age');
+        const tagSel = document.getElementById('hvt-f-tag');
         if (!langSel) return;
 
         langs.forEach(l => { const o = document.createElement('option'); o.value = l; o.textContent = l; langSel.appendChild(o); });
@@ -350,21 +354,21 @@
     }
 
     function refreshFilters() {
-        const langSel   = document.getElementById('hvt-f-lang');
+        const langSel = document.getElementById('hvt-f-lang');
         const localeSel = document.getElementById('hvt-f-locale');
-        const ageSel    = document.getElementById('hvt-f-age');
-        const tagSel    = document.getElementById('hvt-f-tag');
+        const ageSel = document.getElementById('hvt-f-age');
+        const tagSel = document.getElementById('hvt-f-tag');
         if (!langSel) return;
         const prevLang = langSel.value, prevLocale = localeSel.value;
-        const prevAge  = ageSel.value,  prevTag    = tagSel?.value || '';
-        while (langSel.options.length   > 1) langSel.remove(1);
+        const prevAge = ageSel.value, prevTag = tagSel?.value || '';
+        while (langSel.options.length > 1) langSel.remove(1);
         while (localeSel.options.length > 1) localeSel.remove(1);
-        while (ageSel.options.length    > 1) ageSel.remove(1);
+        while (ageSel.options.length > 1) ageSel.remove(1);
         while (tagSel && tagSel.options.length > 1) tagSel.remove(1);
         populateFilters();
-        langSel.value   = prevLang;
+        langSel.value = prevLang;
         localeSel.value = prevLocale;
-        ageSel.value    = prevAge;
+        ageSel.value = prevAge;
         if (tagSel) tagSel.value = prevTag;
     }
 
@@ -372,9 +376,9 @@
     function exportData() {
         const json = JSON.stringify(db, null, 2);
         const blob = new Blob([json], { type: 'application/json' });
-        const url  = URL.createObjectURL(blob);
-        const a    = document.createElement('a');
-        a.href     = url;
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
         a.download = `hvt-voices-${new Date().toISOString().slice(0, 10)}.json`;
         document.body.appendChild(a);
         a.click();
@@ -388,7 +392,7 @@
         let count = 0;
         for (const id in imported.voices) {
             const existing = db.voices[id] || {};
-            db.voices[id]  = {
+            db.voices[id] = {
                 ...imported.voices[id],
                 notes: existing.notes || imported.voices[id].notes || '',
             };
@@ -422,18 +426,18 @@
         const tbody = document.getElementById('hvt-tbody');
         if (!tbody) return;
 
-        const list        = getFilteredVoices();
+        const list = getFilteredVoices();
         const totalVoices = Object.keys(db.voices).length;
-        const statsEl     = document.getElementById('hvt-stats');
+        const statsEl = document.getElementById('hvt-stats');
         if (statsEl) {
             if (totalVoices === 0) {
                 statsEl.innerHTML = '暂无数据，请点击「获取/更新人声」';
             } else {
-                const q       = (document.getElementById('hvt-search')?.value  || '').trim();
+                const q = (document.getElementById('hvt-search')?.value || '').trim();
                 const fLocale = document.getElementById('hvt-f-locale')?.value || '';
                 const fGender = document.getElementById('hvt-f-gender')?.value || '';
-                const fAge    = document.getElementById('hvt-f-age')?.value    || '';
-                const fTag    = document.getElementById('hvt-f-tag')?.value    || '';
+                const fAge = document.getElementById('hvt-f-age')?.value || '';
+                const fTag = document.getElementById('hvt-f-tag')?.value || '';
                 const hasDropdown = fLocale || fGender || fAge || fTag || q;
 
                 let modeTag = '';
@@ -450,7 +454,7 @@
 
         // Show/hide description column based on data content
         const showDesc = hasAnyDescription();
-        const table    = document.getElementById('hvt-table');
+        const table = document.getElementById('hvt-table');
         if (table) table.classList.toggle('hvt-no-desc', !showDesc);
 
         if (list.length === 0) {
@@ -469,14 +473,14 @@
                 tr.classList.add('hvt-row-paste-match');
             }
 
-            const flag       = localeToFlag(v.locale);
+            const flag = localeToFlag(v.locale);
             const localeCode = v.locale || '—';
-            const gender     = (v.gender || '').toLowerCase();
-            const genderIcon  = gender === 'female' ? '♀' : (gender === 'male' ? '♂' : '—');
+            const gender = (v.gender || '').toLowerCase();
+            const genderIcon = gender === 'female' ? '♀' : (gender === 'male' ? '♂' : '—');
             const genderClass = gender === 'female' ? 'hvt-f' : (gender === 'male' ? 'hvt-m' : '');
-            const shortId    = v.voice_id ? (v.voice_id.slice(0, 8) + '…') : '—';
+            const shortId = v.voice_id ? (v.voice_id.slice(0, 8) + '…') : '—';
             const previewUrl = v.preview_audio || '';
-            const statusIcon  = v.existsOnHeygen !== false ? '✅' : '⚠️';
+            const statusIcon = v.existsOnHeygen !== false ? '✅' : '⚠️';
             const statusTitle = v.existsOnHeygen !== false ? '在 HeyGen 中存在' : '此人声已从 HeyGen 下架或找不到';
 
             const tagsHtml = (v.labels || [])
@@ -555,7 +559,7 @@
                 td.classList.add('hvt-copied');
                 setTimeout(() => td.classList.remove('hvt-copied'), 600);
                 showToast('✅ 已复制', 'success', 1200);
-            } catch(err) {
+            } catch (err) {
                 showToast('复制失败', 'error');
             }
         });
@@ -577,8 +581,8 @@
         const el = document.getElementById('hvt-sync-info');
         if (!el) return;
         if (db.lastSync) {
-            const d       = new Date(db.lastSync);
-            const total   = Object.keys(db.voices).length;
+            const d = new Date(db.lastSync);
+            const total = Object.keys(db.voices).length;
             const missing = Object.values(db.voices).filter(v => v.existsOnHeygen === false).length;
             const missingSpan = missing > 0
                 ? ` | <span id="hvt-missing-btn" style="cursor:pointer;text-decoration:underline;color:${showMissingOnly ? '#dc2626' : '#b45309'}">⚠️ ${missing} 个已下架</span>`
@@ -598,9 +602,9 @@
 
     // ─── Build UI ─────────────────────────────────────────────────────────────
     function buildUI() {
-        const fab  = document.createElement('button');
-        fab.id     = 'hvt-fab';
-        fab.title  = 'Heygen Helper T3 / Voice Tester';
+        const fab = document.createElement('button');
+        fab.id = 'hvt-fab';
+        fab.title = 'Heygen Helper T3 / Voice Tester';
         fab.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M3 18v-6a9 9 0 0 1 18 0v6"/>
             <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z"/>
@@ -609,7 +613,7 @@
         document.body.appendChild(fab);
 
         const root = document.createElement('div');
-        root.id    = 'hvt-root';
+        root.id = 'hvt-root';
         root.innerHTML = `
 <div id="hvt-modal">
 
@@ -693,10 +697,10 @@
         updateSyncInfo();
         populateFilters();
         // Pre-select defaults (only if value exists in loaded data)
-        const langEl   = document.getElementById('hvt-f-lang');
+        const langEl = document.getElementById('hvt-f-lang');
         const localeEl = document.getElementById('hvt-f-locale');
-        if (LANGUAGE       && [...langEl.options].some(o => o.value === LANGUAGE))
-            langEl.value   = LANGUAGE;
+        if (LANGUAGE && [...langEl.options].some(o => o.value === LANGUAGE))
+            langEl.value = LANGUAGE;
         if (DEFAULT_LOCALE && [...localeEl.options].some(o => o.value === DEFAULT_LOCALE))
             localeEl.value = DEFAULT_LOCALE;
         renderTable();
@@ -764,10 +768,10 @@
         });
 
         document.getElementById('hvt-btn-default-filters').addEventListener('click', () => {
-            const langEl   = document.getElementById('hvt-f-lang');
+            const langEl = document.getElementById('hvt-f-lang');
             const localeEl = document.getElementById('hvt-f-locale');
-            if (LANGUAGE       && [...langEl.options].some(o => o.value === LANGUAGE))
-                langEl.value   = LANGUAGE;
+            if (LANGUAGE && [...langEl.options].some(o => o.value === LANGUAGE))
+                langEl.value = LANGUAGE;
             else langEl.value = '';
             if (DEFAULT_LOCALE && [...localeEl.options].some(o => o.value === DEFAULT_LOCALE))
                 localeEl.value = DEFAULT_LOCALE;
@@ -779,12 +783,12 @@
         });
 
         document.getElementById('hvt-btn-clear-filters').addEventListener('click', () => {
-            document.getElementById('hvt-f-lang').value   = '';
+            document.getElementById('hvt-f-lang').value = '';
             document.getElementById('hvt-f-locale').value = '';
             document.getElementById('hvt-f-gender').value = '';
-            document.getElementById('hvt-f-age').value    = '';
-            document.getElementById('hvt-f-tag').value    = '';
-            document.getElementById('hvt-search').value   = '';
+            document.getElementById('hvt-f-age').value = '';
+            document.getElementById('hvt-f-tag').value = '';
+            document.getElementById('hvt-search').value = '';
             activeFilterMode = 'dropdown';
             showMissingOnly = false;
             updateSyncInfo();
@@ -812,6 +816,7 @@
                 return;
             }
             pasteFilterIds = ids;
+            pasteFilterOrder = new Map([...ids].map((id, i) => [id, i]));
             activeFilterMode = 'paste';
             document.getElementById('hvt-paste-hint').textContent = `解析到 ${ids.size} 个 ID`;
             renderTable();
@@ -820,9 +825,10 @@
 
         document.getElementById('hvt-btn-clear-paste').addEventListener('click', () => {
             pasteFilterIds = null;
+            pasteFilterOrder = null;
             activeFilterMode = 'dropdown';
-            document.getElementById('hvt-paste-area').value           = '';
-            document.getElementById('hvt-paste-hint').textContent      = '';
+            document.getElementById('hvt-paste-area').value = '';
+            document.getElementById('hvt-paste-hint').textContent = '';
             renderTable();
         });
 
@@ -832,11 +838,11 @@
                 downloadCancelled = true;
                 return;
             }
-            const fLang   = (document.getElementById('hvt-f-lang')?.value   || '').toLowerCase();
+            const fLang = (document.getElementById('hvt-f-lang')?.value || '').toLowerCase();
             const fLocale = (document.getElementById('hvt-f-locale')?.value || '').toLowerCase();
             let voices = Object.values(db.voices);
-            if (fLang)   voices = voices.filter(v => (v.language || '').toLowerCase() === fLang);
-            if (fLocale) voices = voices.filter(v => (v.locale   || '').toLowerCase() === fLocale);
+            if (fLang) voices = voices.filter(v => (v.language || '').toLowerCase() === fLang);
+            if (fLocale) voices = voices.filter(v => (v.locale || '').toLowerCase() === fLocale);
             voices.sort((a, b) => (a.display_name || '').localeCompare(b.display_name || ''));
             if (voices.length === 0) { showToast('当前范围没有人声', 'error'); return; }
             const scopeLabel = [fLang, fLocale].filter(Boolean).join(' / ') || '全部';
@@ -851,12 +857,12 @@
         const btnAbort = document.getElementById('hvt-btn-fetch-abort');
 
         function showFetchControls(show) {
-            btnFetch.style.display = show ? 'none'  : '';
-            btnPause.style.display = show ? ''      : 'none';
-            btnAbort.style.display = show ? ''      : 'none';
+            btnFetch.style.display = show ? 'none' : '';
+            btnPause.style.display = show ? '' : 'none';
+            btnAbort.style.display = show ? '' : 'none';
             if (!show) {
                 btnPause.textContent = '暂停';
-                btnAbort.disabled    = false;
+                btnAbort.disabled = false;
             }
         }
 
@@ -864,13 +870,13 @@
             if (fetchInProgress) return;
 
             fetchInProgress = true;
-            fetchCancelled  = false;
-            fetchPaused     = false;
+            fetchCancelled = false;
+            fetchPaused = false;
 
             const progress = document.getElementById('hvt-progress');
-            const langFilter   = document.getElementById('hvt-f-lang')?.value   || '';
+            const langFilter = document.getElementById('hvt-f-lang')?.value || '';
             const localeFilter = document.getElementById('hvt-f-locale')?.value || '';
-            const scopeLabel   = [langFilter, localeFilter].filter(Boolean).join(' / ') || '全部';
+            const scopeLabel = [langFilter, localeFilter].filter(Boolean).join(' / ') || '全部';
 
             showFetchControls(true);
             btnFetch.classList.add('hvt-loading');
@@ -896,8 +902,8 @@
                 showToast('获取失败: ' + e.message, 'error', 4000);
             } finally {
                 fetchInProgress = false;
-                fetchCancelled  = false;
-                fetchPaused     = false;
+                fetchCancelled = false;
+                fetchPaused = false;
                 btnFetch.classList.remove('hvt-loading');
                 showFetchControls(false);
             }
@@ -912,8 +918,8 @@
         btnAbort.addEventListener('click', () => {
             if (!fetchInProgress) return;
             fetchCancelled = true;
-            fetchPaused    = false;   // 如果处于暂停中，解除暂停让循环能检测到终止
-            btnAbort.disabled   = true;
+            fetchPaused = false;   // 如果处于暂停中，解除暂停让循环能检测到终止
+            btnAbort.disabled = true;
             btnPause.textContent = '暂停';
         });
 
@@ -945,7 +951,7 @@
             const file = e.target.files[0];
             if (!file) return;
             try {
-                const text  = await file.text();
+                const text = await file.text();
                 const count = importData(text);
                 refreshFilters();
                 renderTable();
