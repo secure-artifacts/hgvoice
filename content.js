@@ -31,6 +31,164 @@
     let downloadInProgress = false;
     let downloadCancelled = false;
     let activeFilterMode = 'dropdown'; // 'paste' | 'dropdown' — last-applied wins
+    let vdAudioEl = null; // audio element for voice design preview
+    let selectedTags = new Set(); // multi-select tag chip filter
+
+    // ─── Tag / Age translation tables (module-scope so filter logic can use them) ─
+    const TAG_ZH = {
+        // ── 广告 ──────────────────────────────────────────────
+        'ads':'广告','advertisement':'广告','advertising':'广告',
+
+        // ── 商务（合并 corporate / business / professional / formal / 企业培训 / 商业教育）──
+        'corporate':'商务','business':'商务',
+        'professional':'商务','formal':'商务',
+        'corporate training':'商务','business education':'商务',
+
+        // ── 教育（合并 educational / educational narration / informative educational / e-learning / instructional / tutorial）──
+        'education':'教育','educational':'教育',
+        'educational narration':'教育','informative educational':'教育',
+        'e-learning':'教育','elearning':'教育',
+        'instructional':'教育','tutorial':'教育',
+
+        // ── 培训（保留，与教育有场景区别）────────────────────
+        'training':'培训',
+
+        // ── 讲座（保留，正式演讲场景）────────────────────────
+        'lecture':'讲座',
+
+        // ── 解说（合并 explainer + tech explainer）──────────
+        'explainer':'解说','tech explainer':'解说',
+
+        // ── 知性 / 清晰易懂 ───────────────────────────────────
+        'intellectual':'知性','intelligible':'清晰易懂',
+
+        // ── 有声书 ────────────────────────────────────────────
+        'audiobook':'有声书','audiobooks':'有声书',
+        'audio books':'有声书','audio book':'有声书',
+
+        // ── 叙事旁白（合并 narration / storytelling / storyteller / narrative）──
+        'narration':'叙事旁白','storytelling':'叙事旁白',
+        'storyteller':'叙事旁白','story telling':'叙事旁白',
+        'narrative & story':'叙事旁白','narrative story':'叙事旁白',
+
+        // ── 配音 / 演讲 ───────────────────────────────────────
+        'voice over':'配音','speech':'演讲',
+
+        // ── 纪录片 / 新闻 ─────────────────────────────────────
+        'documentary':'纪录片','news':'新闻',
+
+        // ── 播客（合并 podcast hosting / crypto podcast）──────
+        'podcast':'播客','podcasts':'播客',
+        'podcast hosting':'播客','crypto podcast':'播客',
+
+        // ── 轻松聆听 ──────────────────────────────────────────
+        'easy listening':'轻松聆听',
+
+        // ── 媒体 / 娱乐（合并 entertainment tv）──────────────
+        'media':'媒体',
+        'entertainment':'娱乐','entertainment tv':'娱乐',
+
+        // ── 社交媒体（合并 social + social media）────────────
+        'social':'社交媒体','social media':'社交媒体',
+
+        // ── 游戏 ──────────────────────────────────────────────
+        'games':'游戏','gaming':'游戏',
+
+        // ── 多语言 ────────────────────────────────────────────
+        'multilingual':'多语言',
+
+        // ── 对话式（合并 conversation / conversations 变体）──
+        'conversational':'对话式','conversation':'对话式',
+        'conversations':'对话式','conversationa':'对话式',
+
+        // ── 动画配音（合并 animation + characters animation）──
+        'animation':'动画配音','characters animation':'动画配音',
+
+        // ── 运动 ──────────────────────────────────────────────
+        'sports':'运动',
+
+        // ── 情绪 / 声音个性 ────────────────────────────────────
+        'anxious':'焦虑',
+        'approachable':'亲切','kind':'亲切','friendly':'亲切',  // 合并
+        'articulate':'口齿清晰',
+        'authoritative':'权威',
+        'calm':'平静','peaceful':'平静',                        // 合并
+        'captivating':'迷人',
+        'casual':'随意',
+        'cheerful':'欢快',
+        'cheeky':'俏皮','playful':'俏皮','sassy':'俏皮',         // 合并
+        'chill':'放松','relaxed':'放松','relaxing':'放松',       // 合并
+        'comforting':'安慰',
+        'confident':'自信',
+        'cute':'可爱',
+        'deep':'低沉',
+        'classy':'优雅','elegant':'优雅',                       // 合并
+        'energetic':'活力','vibrant':'活力','spirited':'活力',   // 合并
+        'engaging':'引人入胜',
+        'enthusiastic':'热情洋溢',
+        'enticing':'诱人',
+        'excited':'兴奋','exciting':'兴奋',                     // 合并
+        'expressive':'富有表现力',
+        'gentle':'温柔','tender':'温柔',                        // 合并
+        'happy':'开心',
+        'husky':'沙哑','raspy':'沙哑',                          // 合并
+        'hyped':'亢奋',
+        'intense':'强烈',
+        'inviting':'邀请感',
+        'lively':'活泼',
+        'masculine':'阳刚',
+        'mature':'成熟',
+        'meditative':'冥想','meditation':'冥想','mindfulness':'冥想', // 合并
+        'modulated':'调节',
+        'motivational':'激励',
+        'natural':'自然',
+        'neutral':'中性',
+        'passionate':'热情',
+        'pleasant':'愉悦',
+        'powerful':'有力','strong':'有力',                      // 合并
+        'rich':'浑厚',
+        'robotic':'机械',
+        'rough':'粗犷',
+        'sad':'悲伤',
+        'serious':'严肃',
+        'smooth':'流畅',
+        'soft':'柔和',
+        'soothing':'舒缓',
+        'sweet':'甜美',
+        'trustworthy':'可信赖',
+        'upbeat':'积极',
+        'velvety':'丝绒般',
+        'warm':'温暖',
+        'whispery':'低语','whispering':'低语',                  // 合并
+        'wise':'睿智',
+        'witty':'机智',
+        'youthful':'年轻',
+        'bold':'大胆',
+        'bright':'明亮',
+        'crisp':'清脆',
+        'dynamic':'动感',
+        'empathetic':'共情',
+        'melodic':'悦耳',
+        'refined':'精致','sophisticated':'精致',               // 合并
+        'sincere':'真诚',
+        'steady':'稳重',
+        'uplifting':'振奋',
+        'versatile':'多变',
+
+        // ── 年龄标签 ──────────────────────────────────────────
+        'kids':'儿童','child':'儿童','childish':'童声','kid':'小孩',
+        'young':'年轻','youth':'年轻','youthful':'年轻','teen':'青少年',
+        'middle age':'中年','middle aged':'中年',
+        'middle-aged':'中年','middle_aged':'中年',
+        'senior':'老年','elderly':'老年','old':'老年','older':'年长',
+
+        // ── 其他 ──────────────────────────────────────────────
+        'pvc':'PVC',
+    };
+    let mvAudioEl = null; // audio element for my-voices preview
+    let mvPlayingId = null; // currently playing voice id in my-voices panel
+    let mvVoices = []; // cached my-voices list
+    let mvSelectedIds = new Set(); // checked voices for batch download
 
     // ─── Storage ──────────────────────────────────────────────────────────────
     function loadDb() {
@@ -51,17 +209,21 @@
     }
 
     // ─── API ──────────────────────────────────────────────────────────────────
+    const HVT_FETCH_HEADERS = {
+        'accept': 'application/json, text/plain, */*',
+        'x-ver': '4.1.0',
+        'x-language-override': 'en-US',
+        'origin': 'https://app.heygen.com',
+        'referer': 'https://app.heygen.com/',
+    };
+
     async function heygenApi(path, options = {}, _retries = 2) {
         const isPost = (options.method || 'GET').toUpperCase() !== 'GET';
         const res = await fetch(`${API_BASE}${path}`, {
             ...options,
             credentials: 'include',
             headers: {
-                'accept': 'application/json, text/plain, */*',
-                'x-ver': '4.1.0',
-                'x-language-override': 'en-US',
-                'origin': 'https://app.heygen.com',
-                'referer': 'https://app.heygen.com/',
+                ...HVT_FETCH_HEADERS,
                 ...(isPost ? { 'Content-Type': 'application/json' } : {}),
                 ...(options.headers || {}),
             },
@@ -80,6 +242,58 @@
         }
         if (j.code !== 100) throw new Error(j.msg || j.message || `code=${j.code}`);
         return j.data;
+    }
+
+    // Fetch voice-design preview via v2 NDJSON stream endpoint.
+    // Required headers: Accept: application/x-ndjson + x-heygen-service: voice
+    // Audio generation takes ~8-12 s, so poll on 404 until ready.
+    async function vdPreviewStream(requestId, optionId) {
+        const url = `${API_BASE}/v2/voice_design/preview.stream?request_id=${encodeURIComponent(requestId)}&option_id=${encodeURIComponent(optionId)}`;
+        const headers = { ...HVT_FETCH_HEADERS, 'accept': 'application/x-ndjson', 'x-heygen-service': 'voice' };
+
+        const MAX_TRIES = 15;
+        const RETRY_MS  = 2000;
+
+        // Audio generation typically takes ~8-12 s; wait 6 s before first attempt
+        await new Promise(r => setTimeout(r, 6000));
+
+        for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+            const res = await fetch(url, { credentials: 'include', headers });
+
+            if (res.status === 404 && attempt < MAX_TRIES) {
+                // Audio not ready yet — wait and retry
+                await new Promise(r => setTimeout(r, RETRY_MS));
+                continue;
+            }
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+            // Response is NDJSON: 270 lines of base64 chunks (many are 1-byte heartbeats).
+            // Each chunk must be decoded individually — concatenating base64 strings
+            // breaks because intermediate == padding corrupts the combined string.
+            const text = await res.text();
+            const decodedChunks = [];
+            let totalLen = 0;
+            for (const line of text.split('\n')) {
+                const t = line.trim();
+                if (!t) continue;
+                try {
+                    const obj = JSON.parse(t);
+                    if (obj.audio_bytes) {
+                        const bin = atob(obj.audio_bytes);
+                        const arr = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+                        decodedChunks.push(arr);
+                        totalLen += arr.length;
+                    }
+                } catch { /* skip non-JSON lines */ }
+            }
+            if (totalLen === 0) throw new Error('无音频数据');
+            const combined = new Uint8Array(totalLen);
+            let offset = 0;
+            for (const chunk of decodedChunks) { combined.set(chunk, offset); offset += chunk.length; }
+            return combined; // Uint8Array of MP3 bytes
+        }
+        throw new Error('音频生成超时，请稍后重试');
     }
 
     // ─── Fetch & merge ────────────────────────────────────────────────────────
@@ -267,13 +481,12 @@
     }
 
     // ─── Filters ──────────────────────────────────────────────────────────────
-    function getFilteredVoices() {
+    function getFilteredVoices(skipTagFilter = false) {
         const q = (document.getElementById('hvt-search')?.value || '').toLowerCase().trim();
         const fLocale = (document.getElementById('hvt-f-locale')?.value || '').toLowerCase();
         const fGender = (document.getElementById('hvt-f-gender')?.value || '').toLowerCase();
         const fLang = (document.getElementById('hvt-f-lang')?.value || '').toLowerCase();
         const fAge = (document.getElementById('hvt-f-age')?.value || '').toLowerCase();
-        const fTag = (document.getElementById('hvt-f-tag')?.value || '').toLowerCase();
 
         let list = Object.values(db.voices);
 
@@ -290,17 +503,38 @@
             return list;
         }
 
+        // Helper: read all merged values stored in data-vals attribute of selected option
+        function selVals(selId, fallback) {
+            const sel = document.getElementById(selId);
+            const opt = sel?.options[sel.selectedIndex];
+            const raw = opt?.dataset?.vals || fallback || '';
+            return raw.split('|').filter(Boolean);
+        }
+
         if (showMissingOnly) { list = list.filter(v => v.existsOnHeygen === false); return list; }
         if (fLang) list = list.filter(v => (v.language || '').toLowerCase() === fLang);
-        if (fLocale) list = list.filter(v => (v.locale || '').toLowerCase() === fLocale);
+        if (fLocale) {
+            const localeVals = selVals('hvt-f-locale', fLocale);
+            list = list.filter(v => localeVals.includes((v.locale || '').trim().toLowerCase()));
+        }
         if (fGender) list = list.filter(v => (v.gender || '').toLowerCase() === fGender);
-        if (fAge) list = list.filter(v => {
-            const hay = ((v.age || '') + ' ' + (v.labels || []).join(' ')).toLowerCase();
-            return hay.includes(fAge);
-        });
-        if (fTag) list = list.filter(v =>
-            (v.labels || []).some(l => normalizeAge(l).toLowerCase() === fTag)
-        );
+        if (fAge) {
+            const ageVals = selVals('hvt-f-age', fAge);
+            list = list.filter(v => {
+                const hay = ((v.age || '') + ' ' + (v.labels || []).join(' ')).toLowerCase();
+                return ageVals.some(val => hay.includes(val));
+            });
+        }
+        if (selectedTags.size > 0 && !skipTagFilter) {
+            // AND 逻辑：声音必须同时包含所有选中标签
+            const voiceLabelSet = (v) => new Set(
+                (v.labels || []).map(l => TAG_ZH[l.toLowerCase()] || normalizeAge(l))
+            );
+            list = list.filter(v => {
+                const ls = voiceLabelSet(v);
+                return [...selectedTags].every(tag => ls.has(tag));
+            });
+        }
 
         if (q) {
             list = list.filter(v => {
@@ -338,38 +572,267 @@
         });
 
         // All unique labels for tag filter – normalized to Title Case to deduplicate
+        // Exclude gender labels (male/female) — already covered by the gender dropdown
+        const GENDER_LABELS = new Set(['male', 'female']);
         const allTags = new Set();
-        voices.forEach(v => (v.labels || []).forEach(l => { if (l.trim()) allTags.add(normalizeAge(l.trim())); }));
+        voices.forEach(v => (v.labels || []).forEach(l => {
+            if (l.trim() && !GENDER_LABELS.has(l.trim().toLowerCase()))
+                allTags.add(normalizeAge(l.trim()));
+        }));
 
         const langSel = document.getElementById('hvt-f-lang');
         const localeSel = document.getElementById('hvt-f-locale');
         const ageSel = document.getElementById('hvt-f-age');
-        const tagSel = document.getElementById('hvt-f-tag');
+        const tagChipPanel = document.getElementById('hvt-tag-chip-panel');
         if (!langSel) return;
 
-        langs.forEach(l => { const o = document.createElement('option'); o.value = l; o.textContent = l; langSel.appendChild(o); });
-        locales.forEach(l => { const o = document.createElement('option'); o.value = l; o.textContent = l; localeSel.appendChild(o); });
-        [...ages].sort().forEach(a => { const o = document.createElement('option'); o.value = a; o.textContent = a; ageSel.appendChild(o); });
-        [...allTags].sort().forEach(t => { const o = document.createElement('option'); o.value = t; o.textContent = t; tagSel?.appendChild(o); });
+        const LANG_ZH = {
+            'arabic':'阿拉伯语','bangla':'孟加拉语','bulgarian':'保加利亚语',
+            'catalan':'加泰罗尼亚语','chinese':'中文','croatian':'克罗地亚语',
+            'czech':'捷克语','danish':'丹麦语','dutch':'荷兰语',
+            'english':'英语','estonian':'爱沙尼亚语','filipino':'菲律宾语',
+            'finnish':'芬兰语','french':'法语','georgian':'格鲁吉亚语',
+            'german':'德语','greek':'希腊语','gujarati':'古吉拉特语',
+            'hebrew':'希伯来语','hindi':'印地语','hungarian':'匈牙利语',
+            'indonesian':'印尼语','italian':'意大利语','japanese':'日语',
+            'kannada':'卡纳达语','kiswahili':'斯瓦希里语','korean':'韩语',
+            'latvian':'拉脱维亚语','lithuanian':'立陶宛语','malay':'马来语',
+            'marathi':'马拉地语','multilingual':'多语言','nepali':'尼泊尔语',
+            'norwegian':'挪威语','persian':'波斯语','polish':'波兰语',
+            'portuguese':'葡萄牙语','romanian':'罗马尼亚语','russian':'俄语',
+            'sinhala':'僧伽罗语','slovak':'斯洛伐克语','spanish':'西班牙语',
+            'swedish':'瑞典语','tamil':'泰米尔语','telugu':'泰卢固语',
+            'thai':'泰语','turkey':'土耳其语','turkish':'土耳其语',
+            'ukrainian':'乌克兰语','urdu':'乌尔都语','vietnamese':'越南语',
+            'en':'英语','es':'西班牙语','unknown':'未知',
+        };
+        const LOCALE_ZH = {
+            // 英语
+            'en-US':'英语（美国）','en-GB':'英语（英国）','en-UK':'英语（英国）',
+            'en_UK':'英语（英国）','en-AU':'英语（澳大利亚）','en-CA':'英语（加拿大）',
+            'en-IN':'英语（印度）','en-IE':'英语（爱尔兰）','en-NZ':'英语（新西兰）',
+            'en-ZA':'英语（南非）','en-SG':'英语（新加坡）','en-HK':'英语（香港）',
+            'en-GH':'英语（加纳）','en-KE':'英语（肯尼亚）','en-NG':'英语（尼日利亚）',
+            'en-ES':'英语（西班牙）',
+            // 中文
+            'zh-CN':'中文（中国大陆）','zh-TW':'中文（台湾）','zh-HK':'中文（香港）',
+            // 日韩
+            'ja-JP':'日语（日本）','ko-KR':'韩语（韩国）',
+            // 法语
+            'fr-FR':'法语（法国）','fr-CA':'法语（加拿大）',
+            'fr-BE':'法语（比利时）','fr-CH':'法语（瑞士）',
+            // 德语
+            'de-DE':'德语（德国）','de-AT':'德语（奥地利）','de-CH':'德语（瑞士）',
+            // 西班牙语
+            'es-ES':'西班牙语（西班牙）','es-MX':'西班牙语（墨西哥）',
+            'es-US':'西班牙语（美国）','es-AR':'西班牙语（阿根廷）',
+            'es-CO':'西班牙语（哥伦比亚）','es-CL':'西班牙语（智利）',
+            'es-BO':'西班牙语（玻利维亚）','es-GT':'西班牙语（危地马拉）',
+            'es-PE':'西班牙语（秘鲁）','es-SV':'西班牙语（萨尔瓦多）',
+            'es-UY':'西班牙语（乌拉圭）','es-VE':'西班牙语（委内瑞拉）',
+            // 葡萄牙语
+            'pt-BR':'葡萄牙语（巴西）','pt-PT':'葡萄牙语（葡萄牙）',
+            // 意大利 / 俄语
+            'it-IT':'意大利语（意大利）','ru-RU':'俄语（俄罗斯）',
+            // 阿拉伯语
+            'ar-SA':'阿拉伯语（沙特阿拉伯）','ar-AE':'阿拉伯语（阿联酋）',
+            'ar-EG':'阿拉伯语（埃及）','ar-MA':'阿拉伯语（摩洛哥）',
+            'ar-BH':'阿拉伯语（巴林）','ar-DZ':'阿拉伯语（阿尔及利亚）',
+            'ar-IQ':'阿拉伯语（伊拉克）','ar-JO':'阿拉伯语（约旦）',
+            'ar-KW':'阿拉伯语（科威特）','ar-LY':'阿拉伯语（利比亚）',
+            'ar-QA':'阿拉伯语（卡塔尔）','ar-SY':'阿拉伯语（叙利亚）',
+            'ar-TN':'阿拉伯语（突尼斯）','ar-YE':'阿拉伯语（也门）',
+            // 南亚
+            'hi-IN':'印地语（印度）','bn-BD':'孟加拉语（孟加拉）',
+            'bn-IN':'孟加拉语（印度）','ur-PK':'乌尔都语（巴基斯坦）',
+            'ur-IN':'乌尔都语（印度）','fa-IR':'波斯语（伊朗）',
+            'ne-NP':'尼泊尔语（尼泊尔）','si-LK':'僧伽罗语（斯里兰卡）',
+            'gu-IN':'古吉拉特语（印度）','mr-IN':'马拉地语（印度）',
+            'ta-IN':'泰米尔语（印度）','ta-LK':'泰米尔语（斯里兰卡）',
+            'te-IN':'泰卢固语（印度）','kn-IN':'卡纳达语（印度）',
+            'ml-IN':'马拉雅拉姆语（印度）','pa-IN':'旁遮普语（印度）',
+            // 东南亚
+            'id-ID':'印尼语（印度尼西亚）','ms-MY':'马来语（马来西亚）',
+            'th-TH':'泰语（泰国）','vi-VN':'越南语（越南）',
+            'tl-PH':'菲律宾语（菲律宾）','fil-PH':'菲律宾语（菲律宾）',
+            'ceb-PH':'宿务语（菲律宾）','jv-ID':'爪哇语（印度尼西亚）',
+            // 欧洲
+            'nl-NL':'荷兰语（荷兰）','nl-BE':'荷兰语（比利时）',
+            'pl-PL':'波兰语（波兰）','tr-TR':'土耳其语（土耳其）',
+            'sv-SE':'瑞典语（瑞典）','da-DK':'丹麦语（丹麦）',
+            'fi-FI':'芬兰语（芬兰）','nb-NO':'挪威语（挪威）',
+            'cs-CZ':'捷克语（捷克）','sk-SK':'斯洛伐克语（斯洛伐克）',
+            'hu-HU':'匈牙利语（匈牙利）','ro-RO':'罗马尼亚语（罗马尼亚）',
+            'bg-BG':'保加利亚语（保加利亚）','hr-HR':'克罗地亚语（克罗地亚）',
+            'uk-UA':'乌克兰语（乌克兰）','el-GR':'希腊语（希腊）',
+            'he-IL':'希伯来语（以色列）','lt-LT':'立陶宛语（立陶宛）',
+            'lv-LV':'拉脱维亚语（拉脱维亚）','et-EE':'爱沙尼亚语（爱沙尼亚）',
+            'ca-ES':'加泰罗尼亚语（西班牙）',
+            // 高加索 / 中亚
+            'ka-GE':'格鲁吉亚语（格鲁吉亚）',
+            // 非洲
+            'sw-KE':'斯瓦希里语（肯尼亚）','sw-TZ':'斯瓦希里语（坦桑尼亚）',
+            'af-ZA':'南非荷兰语（南非）',
+            // 特殊
+            'multi':'多语言','unknown':'未知',
+        };
+        langs.forEach(l => {
+            const o = document.createElement('option');
+            o.value = l;
+            o.textContent = LANG_ZH[l.trim().toLowerCase()] || l;
+            langSel.appendChild(o);
+        });
+
+        // Locale: group by Chinese name to deduplicate (e.g. en-GB / en-UK / en_UK → 英语（英国）)
+        {
+            const localeGroups = new Map(); // chineseName → { display, vals[] }
+            locales.forEach(l => {
+                const key = l.trim();
+                const cn = LOCALE_ZH[key];
+                const groupKey = cn || key;
+                if (!localeGroups.has(groupKey)) {
+                    localeGroups.set(groupKey, { cn, primaryKey: key, vals: [] });
+                }
+                localeGroups.get(groupKey).vals.push(key.toLowerCase());
+            });
+            const isEnLocale = ({ primaryKey }) =>
+                /^en[-_]/i.test(primaryKey);
+
+            // English locales first (en-US at top), then rest sorted by Chinese name
+            const EN_ORDER = ['en-US','en-GB','en-AU','en-CA','en-IN','en-IE','en-NZ','en-ZA','en-SG','en-HK','en-GH','en-KE','en-NG','en-ES'];
+            [...localeGroups.entries()].sort(([keyA, a], [keyB, b]) => {
+                const aEn = isEnLocale(a), bEn = isEnLocale(b);
+                if (aEn && !bEn) return -1;
+                if (!aEn && bEn) return 1;
+                if (aEn && bEn) {
+                    const ai = EN_ORDER.findIndex(c => a.vals.includes(c.toLowerCase()));
+                    const bi = EN_ORDER.findIndex(c => b.vals.includes(c.toLowerCase()));
+                    if (ai === -1 && bi === -1) return keyA.localeCompare(keyB, 'zh');
+                    if (ai === -1) return 1;
+                    if (bi === -1) return -1;
+                    return ai - bi;
+                }
+                return keyA.localeCompare(keyB, 'zh');
+            }).forEach(([, { cn, primaryKey, vals }]) => {
+                const o = document.createElement('option');
+                o.value = vals[0];
+                o.dataset.vals = vals.join('|');
+                // If merged multiple codes, show only the Chinese name; otherwise show code too
+                o.textContent = cn ? (vals.length > 1 ? cn : `${cn}（${primaryKey}）`) : primaryKey;
+                localeSel.appendChild(o);
+            });
+        }
+
+        const AGE_ZH = {
+            'child': '儿童', 'childish': '童声', 'kid': '小孩',
+            'teen': '青少年', 'teenager': '青少年', 'young': '年轻',
+            'young adult': '青年', 'adult': '成人',
+            'middle age': '中年', 'middle aged': '中年', 'middle-aged': '中年', 'middle_aged': '中年',
+            'mature': '成熟', 'senior': '老年', 'elderly': '老年',
+            'old': '老年', 'older': '年长',
+        };
+
+        // Age: group by Chinese label to deduplicate
+        {
+            const ageGroups = new Map(); // chineseLabel → vals[]
+            [...ages].sort().forEach(a => {
+                const label = AGE_ZH[a.toLowerCase()] || a;
+                if (!ageGroups.has(label)) ageGroups.set(label, []);
+                ageGroups.get(label).push(a.toLowerCase());
+            });
+            [...ageGroups.entries()].sort((a, b) => a[0].localeCompare(b[0], 'zh')).forEach(([label, vals]) => {
+                const o = document.createElement('option');
+                o.value = vals[0];
+                o.dataset.vals = vals.join('|');
+                o.textContent = label;
+                ageSel.appendChild(o);
+            });
+        }
+        // Tag chips: group by Chinese label, render as clickable chips
+        if (tagChipPanel) {
+            tagChipPanel.innerHTML = '';
+            const tagGroups = new Map(); // chineseLabel → raw English vals[]
+            [...allTags].sort().forEach(t => {
+                const label = TAG_ZH[t.toLowerCase()] || t;
+                if (!tagGroups.has(label)) tagGroups.set(label, []);
+                tagGroups.get(label).push(t.toLowerCase());
+            });
+            [...tagGroups.keys()].sort((a, b) => a.localeCompare(b, 'zh')).forEach(label => {
+                const chip = document.createElement('button');
+                chip.type = 'button';
+                chip.className = 'hvt-tag-chip' + (selectedTags.has(label) ? ' active' : '');
+                chip.textContent = label;
+                chip.addEventListener('click', () => {
+                    if (selectedTags.has(label)) {
+                        selectedTags.delete(label);
+                        chip.classList.remove('active');
+                    } else {
+                        selectedTags.add(label);
+                        chip.classList.add('active');
+                    }
+                    updateTagBadge();
+                    activeFilterMode = 'dropdown';
+                    showMissingOnly = false;
+                    updateSyncInfo();
+                    renderTable();
+                });
+                tagChipPanel.appendChild(chip);
+            });
+        }
+    }
+
+    function updateTagBadge() {
+        const badge = document.getElementById('hvt-tag-badge');
+        const btn = document.getElementById('hvt-tag-panel-toggle');
+        if (badge) {
+            if (selectedTags.size > 0) {
+                badge.textContent = selectedTags.size;
+                badge.style.display = 'inline-flex';
+            } else {
+                badge.style.display = 'none';
+            }
+        }
+        if (btn) btn.classList.toggle('hvt-tag-btn-active', selectedTags.size > 0);
+    }
+
+    // 根据当前语言/地区/性别/年龄筛选结果，更新 chip 可用性（置灰不在当前范围内的标签）
+    function updateChipAvailability(preTagVoices) {
+        const panel = document.getElementById('hvt-tag-chip-panel');
+        if (!panel) return;
+        // 收集当前可见声音范围内存在的所有中文标签
+        const available = new Set();
+        preTagVoices.forEach(v => {
+            (v.labels || []).forEach(l => {
+                available.add(TAG_ZH[l.toLowerCase()] || normalizeAge(l));
+            });
+        });
+        panel.querySelectorAll('.hvt-tag-chip').forEach(chip => {
+            const label = chip.textContent.trim();
+            // 选中的标签始终保持正常显示；未选中且不在当前范围的置灰
+            const inRange = available.has(label);
+            const isSelected = selectedTags.has(label);
+            chip.classList.toggle('hvt-chip-dim', !inRange && !isSelected);
+            chip.title = (!inRange && !isSelected)
+                ? `当前筛选范围内没有「${label}」标签的声音`
+                : '';
+        });
     }
 
     function refreshFilters() {
         const langSel = document.getElementById('hvt-f-lang');
         const localeSel = document.getElementById('hvt-f-locale');
         const ageSel = document.getElementById('hvt-f-age');
-        const tagSel = document.getElementById('hvt-f-tag');
         if (!langSel) return;
         const prevLang = langSel.value, prevLocale = localeSel.value;
-        const prevAge = ageSel.value, prevTag = tagSel?.value || '';
+        const prevAge = ageSel.value;
         while (langSel.options.length > 1) langSel.remove(1);
         while (localeSel.options.length > 1) localeSel.remove(1);
         while (ageSel.options.length > 1) ageSel.remove(1);
-        while (tagSel && tagSel.options.length > 1) tagSel.remove(1);
-        populateFilters();
+        populateFilters(); // re-renders tag chips too (keeps selectedTags state)
         langSel.value = prevLang;
         localeSel.value = prevLocale;
         ageSel.value = prevAge;
-        if (tagSel) tagSel.value = prevTag;
+        updateTagBadge();
     }
 
     // ─── Export / Import ──────────────────────────────────────────────────────
@@ -425,6 +888,10 @@
     function renderTable() {
         const tbody = document.getElementById('hvt-tbody');
         if (!tbody) return;
+
+        // 先用「不含标签筛选」的结果更新 chip 可用性，让用户看到哪些标签在当前范围内有效
+        const preTagList = getFilteredVoices(true);
+        updateChipAvailability(preTagList);
 
         const list = getFilteredVoices();
         const totalVoices = Object.keys(db.voices).length;
@@ -504,11 +971,19 @@
                         value="${esc(v.notes || '')}" placeholder="备注…">
                 </td>
                 <td class="c-play">
-                    <button class="hvt-play-btn" data-play-id="${esc(v.voice_id)}" data-url="${esc(previewUrl)}"
-                        ${!previewUrl ? 'disabled' : ''} title="${previewUrl ? '试听' : '无预览音频'}">
-                        <svg class="ic-play"  viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/></svg>
-                        <svg class="ic-stop"  viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>
-                    </button>
+                    <div class="hvt-action-strip">
+                        <button class="hvt-play-btn" data-play-id="${esc(v.voice_id)}" data-url="${esc(previewUrl)}"
+                            ${!previewUrl ? 'disabled' : ''} title="${previewUrl ? '听音' : '无预览音频'}">
+                            <svg class="ic-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/></svg>
+                            <svg class="ic-stop" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>
+                        </button>
+                        <button class="hvt-vd-btn" title="AI 生音">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/>
+                                <path d="M20 3v4m2-2h-4"/>
+                            </svg>
+                        </button>
+                    </div>
                 </td>
             `;
             frag.appendChild(tr);
@@ -540,6 +1015,11 @@
                 }
                 togglePlay(btn.dataset.playId, btn.dataset.url);
             });
+        });
+
+        // 生音 buttons – open voice design modal
+        tbody.querySelectorAll('.hvt-vd-btn').forEach(btn => {
+            btn.addEventListener('click', () => openVoiceDesign());
         });
 
         // Double-click any cell to copy text (备注列不支持双击复制)
@@ -600,17 +1080,466 @@
         }
     }
 
+    // ─── Voice Design ─────────────────────────────────────────────────────────
+    function openVoiceDesign() {
+        const overlay = document.getElementById('hvt-vd-overlay');
+        if (overlay) overlay.style.display = 'flex';
+        vdRenderSavedList();
+    }
+
+    function closeVoiceDesign() {
+        const overlay = document.getElementById('hvt-vd-overlay');
+        if (overlay) overlay.style.display = 'none';
+        if (vdAudioEl) { vdAudioEl.pause(); vdAudioEl = null; }
+        document.querySelectorAll('.hvt-vd-preview-btn[data-playing="1"]')
+            .forEach(b => { b.dataset.playing = ''; });
+    }
+
+    async function vdGenerate() {
+        const promptEl  = document.getElementById('hvt-vd-prompt');
+        const genBtn    = document.getElementById('hvt-vd-generate');
+        const statusEl  = document.getElementById('hvt-vd-status');
+        const optionsEl = document.getElementById('hvt-vd-options');
+
+        const name   = 'Voice';
+        const prompt = (promptEl.value || '').trim();
+        if (!prompt) { showToast('请输入提示词', 'error'); return; }
+
+        genBtn.disabled = true;
+        genBtn.textContent = '⏳ 生成中…';
+        statusEl.textContent = '';
+        optionsEl.innerHTML = '';
+        if (vdAudioEl) { vdAudioEl.pause(); vdAudioEl = null; }
+
+        try {
+            const data = await heygenApi('/v1/voice/voice_design/create', {
+                method: 'POST',
+                body: JSON.stringify({ name, prompt, prefer_stream: true }),
+            });
+            const { request_id, options } = data;
+            if (!options || options.length === 0) throw new Error('未返回声音选项');
+
+            optionsEl.innerHTML = options.map(opt => `
+                <div class="hvt-vd-card">
+                    <div class="hvt-vd-card-top">
+                        <button class="hvt-vd-preview-btn" data-req="${esc(request_id)}" data-opt="${esc(opt.id)}" data-url="${esc(opt.audio_url || '')}" title="试听">
+                            <svg class="ic-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/></svg>
+                            <svg class="ic-stop" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>
+                        </button>
+                        <span class="hvt-vd-opt-name" title="点击改名">${esc(opt.name)}</span>
+                        <input class="hvt-vd-opt-name-input" value="${esc(opt.name)}">
+                        <button class="hvt-vd-save-btn hvt-btn"
+                            data-req="${esc(request_id)}" data-opt="${esc(opt.id)}">选用</button>
+                    </div>
+                </div>
+            `).join('');
+
+            // Preview buttons
+            optionsEl.querySelectorAll('.hvt-vd-preview-btn').forEach(btn => {
+                btn.addEventListener('click', () =>
+                    vdPlayPreview(btn.dataset.req, btn.dataset.opt, btn));
+            });
+
+            // Click name → edit
+            optionsEl.querySelectorAll('.hvt-vd-opt-name').forEach(span => {
+                span.addEventListener('click', () => {
+                    const inp = span.nextElementSibling;
+                    span.style.display = 'none';
+                    inp.style.display = 'block';
+                    inp.focus(); inp.select();
+                });
+            });
+            optionsEl.querySelectorAll('.hvt-vd-opt-name-input').forEach(inp => {
+                const commit = () => {
+                    const span = inp.previousElementSibling;
+                    if (inp.value.trim()) span.textContent = inp.value.trim();
+                    inp.style.display = 'none';
+                    span.style.display = '';
+                };
+                inp.addEventListener('blur', commit);
+                inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); commit(); } });
+            });
+
+            // Save buttons
+            optionsEl.querySelectorAll('.hvt-vd-save-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const card = btn.closest('.hvt-vd-card');
+                    const nameSpan = card.querySelector('.hvt-vd-opt-name');
+                    const nameInp  = card.querySelector('.hvt-vd-opt-name-input');
+                    const displayName = (nameInp.style.display !== 'none'
+                        ? nameInp.value : nameSpan.textContent).trim();
+                    vdSave(btn.dataset.req, btn.dataset.opt, displayName, btn, card);
+                });
+            });
+
+        } catch (e) {
+            statusEl.textContent = '生成失败: ' + e.message;
+            showToast('生成失败: ' + e.message, 'error', 4000);
+        } finally {
+            genBtn.disabled = false;
+            genBtn.textContent = '⚡ 生成';
+        }
+    }
+
+    async function vdPlayPreview(requestId, optionId, btn) {
+        if (btn.dataset.playing === '1') {
+            if (vdAudioEl) { vdAudioEl.pause(); vdAudioEl = null; }
+            btn.dataset.playing = '';
+            return;
+        }
+        document.querySelectorAll('.hvt-vd-preview-btn[data-playing="1"]')
+            .forEach(b => { b.dataset.playing = ''; });
+        if (vdAudioEl) { vdAudioEl.pause(); vdAudioEl = null; }
+
+        btn.disabled = true;
+        btn.dataset.loading = '1';
+        try {
+            const audioData = await vdPreviewStream(requestId, optionId); // Uint8Array
+            btn.dataset.loading = '';
+            btn.dataset.playing = '1';
+            const blobUrl = URL.createObjectURL(new Blob([audioData], { type: 'audio/mpeg' }));
+            vdAudioEl = new Audio(blobUrl);
+            vdAudioEl.onended = () => { btn.dataset.playing = ''; URL.revokeObjectURL(blobUrl); vdAudioEl = null; };
+            vdAudioEl.onerror = () => { btn.dataset.playing = ''; URL.revokeObjectURL(blobUrl); vdAudioEl = null; showToast('音频播放失败', 'error'); };
+            await vdAudioEl.play();
+        } catch (e) {
+            btn.dataset.playing = '';
+            btn.dataset.loading = '';
+            showToast('试听失败: ' + e.message, 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async function vdSave(requestId, optionId, displayName, btn, card) {
+        btn.disabled = true;
+        btn.textContent = '保存中…';
+        try {
+            const saved = await heygenApi('/v1/voice/voice_design/select', {
+                method: 'POST',
+                body: JSON.stringify({ request_id: requestId, option_id: optionId, is_hidden: false }),
+            });
+            const voiceId = saved.voice_id;
+
+            if (displayName) {
+                await heygenApi('/v1/voice/rename', {
+                    method: 'POST',
+                    body: JSON.stringify({ voice_id: voiceId, display_name: displayName }),
+                });
+            }
+
+            // Add minimal entry to local db
+            db.voices[voiceId] = Object.assign(db.voices[voiceId] || {}, {
+                voice_id: voiceId,
+                display_name: displayName || voiceId,
+                language: LANGUAGE,
+                locale: DEFAULT_LOCALE,
+                gender: '',
+                age: '',
+                labels: [],
+                preview_audio: '',
+                existsOnHeygen: true,
+                notes: '',
+                source: 'ai_design',
+            });
+            saveDb();
+            refreshFilters();
+            renderTable();
+            vdRenderSavedList();
+
+            btn.textContent = '✅ 已选用';
+            btn.disabled = true;
+            btn.style.background = '#059669';
+            btn.style.borderColor = '#059669';
+            showToast(`✅ 已选用「${displayName}」`, 'success', 3000);
+        } catch (e) {
+            btn.disabled = false;
+            btn.textContent = '选用';
+            showToast('保存失败: ' + e.message, 'error', 4000);
+        }
+    }
+
+    function vdRenderSavedList() {
+        const el = document.getElementById('hvt-vd-saved-list');
+        if (!el) return;
+        const aiVoices = Object.values(db.voices)
+            .filter(v => v.source === 'ai_design')
+            .sort((a, b) => (a.display_name || '').localeCompare(b.display_name || ''));
+        if (aiVoices.length === 0) {
+            el.innerHTML = '<span class="hvt-vd-saved-empty">暂无已生成的声音</span>';
+            return;
+        }
+        el.innerHTML = aiVoices.map(v => `
+            <div class="hvt-vd-saved-row">
+                <span class="hvt-vd-saved-name">${esc(v.display_name || v.voice_id)}</span>
+                <span class="hvt-vd-saved-id">${esc(v.voice_id)}</span>
+            </div>
+        `).join('');
+    }
+
+    // ─── My Voices ────────────────────────────────────────────────────────────
+    // API: GET /v2/pacific/voice_clone/voice.list?page_size=N
+    // Response: { code:100, data:{ data:[{ voice_id, display_name, gender, language,
+    //             preview:{ movio:"s3://heygen-product/..." }, ... }] } }
+    // Audio:  preview.movio  →  s3://heygen-product/PATH  →  https://static.heygen.ai/PATH
+
+    function s3ToHttps(s3url) {
+        if (!s3url) return '';
+        if (s3url.startsWith('https://') || s3url.startsWith('http://')) return s3url;
+        const m = s3url.match(/^s3:\/\/heygen-product\/(.+)$/);
+        return m ? `https://static.heygen.ai/${m[1]}` : '';
+    }
+
+    function mvGetAudioUrl(v) {
+        // preview.movio is the confirmed field from the API
+        const raw = (v.preview && v.preview.movio)
+            || v.preview_audio || v.audio_url || v.sample_audio || v.sample || '';
+        return s3ToHttps(raw);
+    }
+
+    function openMyVoices() {
+        const overlay = document.getElementById('hvt-mv-overlay');
+        if (overlay) { overlay.style.display = 'flex'; mvLoadVoices(); }
+    }
+
+    function closeMyVoices() {
+        const overlay = document.getElementById('hvt-mv-overlay');
+        if (overlay) overlay.style.display = 'none';
+        mvStopAudio();
+    }
+
+    function mvStopAudio() {
+        if (mvAudioEl) { try { mvAudioEl.pause(); } catch (e) { } mvAudioEl = null; }
+        if (mvPlayingId) {
+            const btn = document.querySelector(`.hvt-mv-play-btn[data-mv-id="${CSS.escape(mvPlayingId)}"]`);
+            if (btn) btn.dataset.playing = '';
+            mvPlayingId = null;
+        }
+    }
+
+    // Stream preview audio from HeyGen API → Uint8Array of MP3 bytes
+    // Endpoint: POST /v2/online/voice.stream_preview  body: {voice_id, language}
+    // Response: application/x-ndjson, each line = {audio_bytes: base64} | heartbeat
+    async function mvStreamPreview(voiceId, language) {
+        const res = await fetch(`${API_BASE}/v2/online/voice.stream_preview`, {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+                ...HVT_FETCH_HEADERS,
+                'content-type': 'application/json',
+                'accept': 'application/x-ndjson',
+            },
+            body: JSON.stringify({ voice_id: voiceId, language: language || 'English' }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const text = await res.text();
+        const chunks = [];
+        let totalLen = 0;
+        for (const line of text.split('\n')) {
+            const t = line.trim();
+            if (!t) continue;
+            try {
+                const obj = JSON.parse(t);
+                if (obj.audio_bytes) {
+                    const bin = atob(obj.audio_bytes);
+                    const arr = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+                    chunks.push(arr);
+                    totalLen += arr.length;
+                }
+            } catch { /* skip non-JSON or heartbeat lines */ }
+        }
+        if (totalLen === 0) throw new Error('无音频数据');
+        const combined = new Uint8Array(totalLen);
+        let off = 0;
+        for (const c of chunks) { combined.set(c, off); off += c.length; }
+        return combined;
+    }
+
+    async function mvTogglePlay(v) {
+        const id = v.voice_id;
+        if (mvPlayingId === id) { mvStopAudio(); return; }
+        mvStopAudio();
+        const btn = document.querySelector(`.hvt-mv-play-btn[data-mv-id="${CSS.escape(id)}"]`);
+        if (btn) { btn.dataset.loading = '1'; btn.disabled = true; delete btn.dataset.errored; }
+        try {
+            const audioBytes = await mvStreamPreview(id, v.language || 'English');
+            const blob = new Blob([audioBytes], { type: 'audio/mpeg' });
+            const blobUrl = URL.createObjectURL(blob);
+            mvPlayingId = id;
+            if (btn) { btn.dataset.loading = ''; btn.dataset.playing = '1'; btn.disabled = false; }
+            const a = new Audio(blobUrl);
+            a.onended = () => { mvStopAudio(); URL.revokeObjectURL(blobUrl); };
+            a.onerror = () => {
+                if (mvPlayingId === id) mvStopAudio();
+                if (btn) { btn.dataset.errored = '1'; btn.title = '播放失败'; }
+                URL.revokeObjectURL(blobUrl);
+            };
+            a.play().catch(() => { if (mvPlayingId === id) mvStopAudio(); URL.revokeObjectURL(blobUrl); });
+            mvAudioEl = a;
+        } catch (e) {
+            if (btn) { btn.dataset.loading = ''; btn.dataset.errored = '1'; btn.disabled = false; btn.title = e.message; }
+            showToast(`播放失败: ${e.message}`, 'error', 3000);
+        }
+    }
+
+    async function mvDownloadOne(v) {
+        const name = (v.display_name || v.voice_id || 'voice').replace(/[\\/:*?"<>|]/g, '_');
+        try {
+            const audioBytes = await mvStreamPreview(v.voice_id, v.language || 'English');
+            const blob = new Blob([audioBytes], { type: 'audio/mpeg' });
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = `${name}.mp3`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+        } catch (e) {
+            showToast(`下载「${name}」失败: ${e.message}`, 'error', 4000);
+        }
+    }
+
+    async function mvDownloadSelected() {
+        const pool = mvSelectedIds.size > 0
+            ? mvVoices.filter(v => mvSelectedIds.has(v.voice_id || ''))
+            : [...mvVoices];
+        if (pool.length === 0) { showToast('没有可下载的音频', 'error'); return; }
+        const dlSelBtn = document.getElementById('hvt-mv-dl-sel');
+        const dlAllBtn = document.getElementById('hvt-mv-dl-all');
+        const activeBtn = mvSelectedIds.size > 0 ? dlSelBtn : dlAllBtn;
+        if (activeBtn) activeBtn.disabled = true;
+        let done = 0, failed = 0;
+        for (const v of pool) {
+            if (activeBtn) activeBtn.textContent = `下载中 ${done + 1}/${pool.length}…`;
+            try {
+                await mvDownloadOne(v);
+                done++;
+            } catch { failed++; }
+            await new Promise(r => setTimeout(r, 700));
+        }
+        if (dlAllBtn) { dlAllBtn.disabled = false; dlAllBtn.textContent = '⬇ 全部下载'; }
+        if (dlSelBtn) { dlSelBtn.disabled = false; mvUpdateSelectionUI(); }
+        showToast(failed > 0
+            ? `完成：${done} 成功，${failed} 失败`
+            : `✅ 已下载 ${done} 个音频`, 'success', 3000);
+    }
+
+    function mvUpdateSelectionUI() {
+        const dlSelBtn = document.getElementById('hvt-mv-dl-sel');
+        const selCountEl = document.getElementById('hvt-mv-sel-count');
+        if (!dlSelBtn) return;
+        const n = mvSelectedIds.size;
+        dlSelBtn.style.display = n > 0 ? 'inline-flex' : 'none';
+        dlSelBtn.textContent = `⬇ 下载已选 (${n})`;
+        if (selCountEl) selCountEl.textContent = n > 0 ? `已选 ${n} 个` : '';
+    }
+
+    function mvRenderList() {
+        const listEl = document.getElementById('hvt-mv-list');
+        if (!listEl) return;
+        if (mvVoices.length === 0) {
+            listEl.innerHTML = '<div class="hvt-mv-empty">没有找到声音</div>';
+            return;
+        }
+        listEl.innerHTML = '';
+        mvSelectedIds.clear();
+        mvUpdateSelectionUI();
+        const frag = document.createDocumentFragment();
+        mvVoices.forEach(v => {
+            const id = v.voice_id || '';
+            const name = v.display_name || id;
+            const gender = (v.gender || '').toLowerCase();
+            const genderIcon = gender === 'female' ? '♀' : (gender === 'male' ? '♂' : '');
+            const lang = v.language || '';
+
+            const row = document.createElement('div');
+            row.className = 'hvt-mv-row';
+            row.innerHTML = `
+                <input type="checkbox" class="hvt-mv-chk" title="选择下载">
+                <button class="hvt-mv-play-btn" data-mv-id="${esc(id)}" title="试听（需几秒加载）">
+                    <svg class="ic-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/></svg>
+                    <svg class="ic-stop" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>
+                    <svg class="ic-spin" viewBox="0 0 24 24" style="display:none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2.5" fill="none" stroke-dasharray="28" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/></circle></svg>
+                </button>
+                <span class="hvt-mv-name" title="${esc(name)}">${esc(name)}</span>
+                ${genderIcon ? `<span class="hvt-mv-gender ${gender === 'female' ? 'hvt-f' : 'hvt-m'}">${genderIcon}</span>` : ''}
+                ${lang ? `<span class="hvt-mv-locale">${esc(lang)}</span>` : ''}
+                <button class="hvt-mv-dl-btn hvt-btn" title="下载 MP3">⬇</button>
+            `;
+            const chk = row.querySelector('.hvt-mv-chk');
+            chk.addEventListener('change', () => {
+                if (chk.checked) mvSelectedIds.add(id);
+                else mvSelectedIds.delete(id);
+                mvUpdateSelectionUI();
+            });
+            row.querySelector('.hvt-mv-play-btn').addEventListener('click', () => mvTogglePlay(v));
+            row.querySelector('.hvt-mv-dl-btn').addEventListener('click', () => mvDownloadOne(v));
+            frag.appendChild(row);
+        });
+        listEl.appendChild(frag);
+    }
+
+    async function mvLoadVoices() {
+        const statusEl = document.getElementById('hvt-mv-status');
+        const listEl   = document.getElementById('hvt-mv-list');
+        const countEl  = document.getElementById('hvt-mv-count');
+        const dlAllBtn = document.getElementById('hvt-mv-dl-all');
+        if (!listEl) return;
+
+        if (statusEl) statusEl.textContent = '加载中…';
+        if (dlAllBtn) dlAllBtn.disabled = true;
+        listEl.innerHTML = '';
+        mvVoices = [];
+
+        try {
+            // Fetch all pages from confirmed endpoint
+            let allVoices = [];
+            let page = 1;
+            while (true) {
+                const data = await heygenApi(
+                    `/v2/pacific/voice_clone/voice.list?page_size=50&page=${page}`
+                );
+                // Response shape: heygenApi strips outer .data → { data:[...], total?, has_more? }
+                const list = data.data || data.list || data.voices || [];
+                allVoices = allVoices.concat(list);
+                if (!data.has_more || list.length === 0 || list.length < 50) break;
+                page++;
+            }
+
+            mvVoices = allVoices;
+            if (statusEl) statusEl.textContent = '';
+            if (countEl) countEl.textContent = `共 ${allVoices.length} 个声音`;
+            if (dlAllBtn) dlAllBtn.disabled = false;
+            mvRenderList();
+        } catch (e) {
+            if (statusEl) statusEl.textContent = '加载失败: ' + e.message;
+            listEl.innerHTML = `<div class="hvt-mv-empty" style="color:#dc2626">加载失败: ${esc(e.message)}</div>`;
+        }
+    }
+
     // ─── Build UI ─────────────────────────────────────────────────────────────
     function buildUI() {
-        const fab = document.createElement('button');
-        fab.id = 'hvt-fab';
-        fab.title = 'Heygen Helper T3 / Voice Tester';
-        fab.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 18v-6a9 9 0 0 1 18 0v6"/>
-            <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z"/>
-            <path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
-        </svg>`;
-        document.body.appendChild(fab);
+        const fabStrip = document.createElement('div');
+        fabStrip.id = 'hvt-fab-strip';
+        fabStrip.innerHTML = `
+            <button id="hvt-fab" title="人声筛选工具">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3 18v-6a9 9 0 0 1 18 0v6"/>
+                    <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z"/>
+                    <path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
+                </svg>
+            </button>
+            <div class="hvt-fab-divider"></div>
+            <button id="hvt-fab-vd" title="生音 — AI 声音设计">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/>
+                    <path d="M20 3v4m2-2h-4"/>
+                </svg>
+            </button>
+        `;
+        document.body.appendChild(fabStrip);
 
         const root = document.createElement('div');
         root.id = 'hvt-root';
@@ -618,8 +1547,9 @@
 <div id="hvt-modal">
 
   <div id="hvt-header">
-    <span id="hvt-title">🎙 Heygen Helper T3 / Voice Tester</span>
+    <span id="hvt-title">🎙 人声筛选工具</span>
     <div id="hvt-header-btns">
+      <button id="hvt-btn-my-voices" class="hvt-btn" title="查看并下载我的声音（My Voices）">🎤 我的声音</button>
       <button id="hvt-btn-fetch"    class="hvt-btn hvt-btn-primary">获取 / 更新人声</button>
       <button id="hvt-btn-fetch-pause"  class="hvt-btn" style="display:none">暂停</button>
       <button id="hvt-btn-fetch-abort"  class="hvt-btn hvt-btn-danger" style="display:none">终止</button>
@@ -640,7 +1570,9 @@
         <option value="female">女声 ♀</option>
       </select>
       <select id="hvt-f-age" class="hvt-select"><option value="">所有年龄段</option></select>
-      <select id="hvt-f-tag" class="hvt-select"><option value="">所有属性</option></select>
+      <button id="hvt-tag-panel-toggle" class="hvt-btn hvt-tag-toggle-btn" title="展开属性标签面板，支持多选">
+        属性标签 <span id="hvt-tag-badge" style="display:none"></span>
+      </button>
       <input  id="hvt-search" class="hvt-input" placeholder="关键词搜索（名称 / ID / 标签 / 备注）" />
       <button id="hvt-btn-default-filters" class="hvt-btn" title="恢复默认语言和地区">默认</button>
       <button id="hvt-btn-clear-filters" class="hvt-btn" title="清空此行所有筛选条件">清空</button>
@@ -651,6 +1583,13 @@
 
       <button id="hvt-paste-toggle" class="hvt-btn hvt-paste-action-btn" style="margin-left:auto">📋 快速试听（粘贴列表）</button>
     </div>
+    <div id="hvt-tag-panel" style="display:none">
+      <div id="hvt-tag-chip-panel"></div>
+      <div class="hvt-tag-panel-footer">
+        <button id="hvt-tag-clear" class="hvt-btn">清除所有标签</button>
+      </div>
+    </div>
+
     <div id="hvt-paste-panel" style="display:none">
       <textarea id="hvt-paste-area" placeholder="粘贴从 Google 表格复制的人声列表，每行格式如：&#10;Sophia - Narration - Friendly/3fb832c2f0f24a0d839b52bd087301a3&#10;Spunky Sandra - Excited 🤩/f43ba83bc30749cc8e8680a317323422"></textarea>
       <div class="hvt-paste-btns">
@@ -676,7 +1615,7 @@
           <th class="c-desc" data-col="c-desc" title="双击复制整列">人声介绍</th>
           <th class="c-tags" data-col="c-tags" title="双击复制整列">属性标签</th>
           <th class="c-notes" data-col="c-notes" title="双击复制整列">备注</th>
-          <th class="c-play">试听</th>
+          <th class="c-play">操作</th>
         </tr>
       </thead>
       <tbody id="hvt-tbody"></tbody>
@@ -693,6 +1632,58 @@
         `;
         document.body.appendChild(root);
 
+        // Voice Design modal — independent top-level element
+        const vdRoot = document.createElement('div');
+        vdRoot.id = 'hvt-vd-overlay';
+        vdRoot.style.display = 'none';
+        vdRoot.innerHTML = `
+            <div id="hvt-vd-panel">
+              <div id="hvt-vd-header">
+                <span id="hvt-vd-title">✨ HeyGen 提示词生成声音</span>
+                <button id="hvt-vd-close" title="关闭">✕</button>
+              </div>
+              <div id="hvt-vd-body">
+                <div class="hvt-vd-form-row">
+                  <label class="hvt-vd-label">提示词</label>
+                  <textarea id="hvt-vd-prompt" class="hvt-vd-textarea" placeholder="描述声音特征：年龄、性别、风格、口音、情绪……&#10;例：A high-pitched, energetic voice of a 4-year-old American boy with a slight childish lisp."></textarea>
+                </div>
+                <div class="hvt-vd-form-actions">
+                  <button id="hvt-vd-generate" class="hvt-btn hvt-btn-primary">⚡ 生成</button>
+                  <span id="hvt-vd-status"></span>
+                </div>
+                <div id="hvt-vd-options"></div>
+                <div id="hvt-vd-saved-section">
+                  <div class="hvt-vd-saved-header">已生成的声音</div>
+                  <div id="hvt-vd-saved-list"></div>
+                </div>
+              </div>
+            </div>
+        `;
+        document.body.appendChild(vdRoot);
+
+        // My Voices modal
+        const mvRoot = document.createElement('div');
+        mvRoot.id = 'hvt-mv-overlay';
+        mvRoot.style.display = 'none';
+        mvRoot.innerHTML = `
+            <div id="hvt-mv-panel">
+              <div id="hvt-mv-header">
+                <span id="hvt-mv-title">🎤 我的声音</span>
+                <div style="display:flex;align-items:center;gap:8px">
+                  <span id="hvt-mv-count" style="font-size:13px;color:#8b8abf"></span>
+                  <span id="hvt-mv-sel-count" style="font-size:13px;color:#a78bfa"></span>
+                  <button id="hvt-mv-refresh" class="hvt-btn" title="刷新列表">↺ 刷新</button>
+                  <button id="hvt-mv-dl-sel" class="hvt-btn hvt-btn-primary" title="下载已勾选的声音" style="display:none">⬇ 下载已选</button>
+                  <button id="hvt-mv-dl-all" class="hvt-btn" title="下载全部声音 MP3">⬇ 全部下载</button>
+                  <button id="hvt-mv-close" title="关闭">✕</button>
+                </div>
+              </div>
+              <div id="hvt-mv-status" style="padding:6px 16px;font-size:13px;color:#8b8abf"></div>
+              <div id="hvt-mv-list"></div>
+            </div>
+        `;
+        document.body.appendChild(mvRoot);
+
         bindEvents();
         updateSyncInfo();
         populateFilters();
@@ -701,8 +1692,13 @@
         const localeEl = document.getElementById('hvt-f-locale');
         if (LANGUAGE && [...langEl.options].some(o => o.value === LANGUAGE))
             langEl.value = LANGUAGE;
-        if (DEFAULT_LOCALE && [...localeEl.options].some(o => o.value === DEFAULT_LOCALE))
-            localeEl.value = DEFAULT_LOCALE;
+        if (DEFAULT_LOCALE) {
+            const target = DEFAULT_LOCALE.toLowerCase();
+            const match = [...localeEl.options].find(o =>
+                o.value === target || (o.dataset.vals || '').split('|').includes(target)
+            );
+            if (match) localeEl.value = match.value;
+        }
         renderTable();
     }
 
@@ -746,6 +1742,10 @@
             root.classList.toggle('hvt-minimized', isMinimized);
         });
 
+        document.getElementById('hvt-fab-vd').addEventListener('click', () => {
+            openVoiceDesign();
+        });
+
         document.getElementById('hvt-close').addEventListener('click', () => {
             document.getElementById('hvt-root').classList.add('hvt-minimized');
             isMinimized = true;
@@ -758,7 +1758,7 @@
             renderTable();
         }, 280));
 
-        ['hvt-f-lang', 'hvt-f-locale', 'hvt-f-gender', 'hvt-f-age', 'hvt-f-tag'].forEach(id => {
+        ['hvt-f-lang', 'hvt-f-locale', 'hvt-f-gender', 'hvt-f-age'].forEach(id => {
             document.getElementById(id)?.addEventListener('change', () => {
                 activeFilterMode = 'dropdown';
                 showMissingOnly = false;
@@ -773,9 +1773,30 @@
             if (LANGUAGE && [...langEl.options].some(o => o.value === LANGUAGE))
                 langEl.value = LANGUAGE;
             else langEl.value = '';
-            if (DEFAULT_LOCALE && [...localeEl.options].some(o => o.value === DEFAULT_LOCALE))
-                localeEl.value = DEFAULT_LOCALE;
-            else localeEl.value = '';
+            if (DEFAULT_LOCALE) {
+                const target = DEFAULT_LOCALE.toLowerCase();
+                const match = [...localeEl.options].find(o =>
+                    o.value === target || (o.dataset.vals || '').split('|').includes(target)
+                );
+                localeEl.value = match ? match.value : '';
+            } else {
+                localeEl.value = '';
+            }
+            activeFilterMode = 'dropdown';
+            showMissingOnly = false;
+            updateSyncInfo();
+            renderTable();
+        });
+
+        document.getElementById('hvt-tag-panel-toggle').addEventListener('click', () => {
+            const panel = document.getElementById('hvt-tag-panel');
+            panel.style.display = panel.style.display === 'none' ? '' : 'none';
+        });
+
+        document.getElementById('hvt-tag-clear').addEventListener('click', () => {
+            selectedTags.clear();
+            document.querySelectorAll('#hvt-tag-chip-panel .hvt-tag-chip.active').forEach(c => c.classList.remove('active'));
+            updateTagBadge();
             activeFilterMode = 'dropdown';
             showMissingOnly = false;
             updateSyncInfo();
@@ -787,8 +1808,10 @@
             document.getElementById('hvt-f-locale').value = '';
             document.getElementById('hvt-f-gender').value = '';
             document.getElementById('hvt-f-age').value = '';
-            document.getElementById('hvt-f-tag').value = '';
             document.getElementById('hvt-search').value = '';
+            selectedTags.clear();
+            document.querySelectorAll('#hvt-tag-chip-panel .hvt-tag-chip.active').forEach(c => c.classList.remove('active'));
+            updateTagBadge();
             activeFilterMode = 'dropdown';
             showMissingOnly = false;
             updateSyncInfo();
@@ -961,6 +1984,23 @@
                 showToast('导入失败: ' + err.message, 'error', 4000);
             }
             e.target.value = '';
+        });
+
+        // Voice Design modal
+        document.getElementById('hvt-vd-close').addEventListener('click', closeVoiceDesign);
+        document.getElementById('hvt-vd-generate').addEventListener('click', vdGenerate);
+        document.getElementById('hvt-vd-overlay').addEventListener('click', (e) => {
+            if (e.target === document.getElementById('hvt-vd-overlay')) closeVoiceDesign();
+        });
+
+        // My Voices modal
+        document.getElementById('hvt-btn-my-voices').addEventListener('click', openMyVoices);
+        document.getElementById('hvt-mv-close').addEventListener('click', closeMyVoices);
+        document.getElementById('hvt-mv-refresh').addEventListener('click', mvLoadVoices);
+        document.getElementById('hvt-mv-dl-all').addEventListener('click', mvDownloadSelected);
+        document.getElementById('hvt-mv-dl-sel').addEventListener('click', mvDownloadSelected);
+        document.getElementById('hvt-mv-overlay').addEventListener('click', (e) => {
+            if (e.target === document.getElementById('hvt-mv-overlay')) closeMyVoices();
         });
     }
 

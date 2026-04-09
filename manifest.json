@@ -1,9 +1,12 @@
 {
     "manifest_version": 3,
-    "name": "Heygen Helper T3 / Voice Tester",
-    "version": "1.3.0",
-    "description": "Heygen Helper T3 – Voice Testing & Management Tool",
-    "permissions": [],
+    "name": "人声筛选工具",
+    "version": "1.4.0",
+    "description": "HeyGen 人声筛选工具 – 声音库筛选、试听、我的声音管理与下载",
+    "permissions": ["downloads"],
+    "background": {
+        "service_worker": "background.js"
+    },
     "host_permissions": [
         "https://*.heygen.com/*",
         "https://*.heygen.ai/*",
