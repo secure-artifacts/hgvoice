@@ -1,0 +1,40 @@
+name: Release Browser Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Package Extension
+        run: |
+          zip -r hgvoice-${{ github.ref_name }}.zip \
+            manifest.json \
+            content.js \
+            content.css \
+            background.js \
+            icon.png \
+            proc11ShareVoice.js \
+            README.md
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'hgvoice-${{ github.ref_name }}.zip'
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: 'hgvoice-${{ github.ref_name }}.zip'
+          generate_release_notes: true
