@@ -38,3 +38,4 @@ jobs:
         with:
           files: 'hgvoice-${{ github.ref_name }}.zip'
           generate_release_notes: true
+          draft: false
