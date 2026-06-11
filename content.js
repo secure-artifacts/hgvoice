@@ -5,6 +5,8 @@
 
     // ─── Constants ────────────────────────────────────────────────────────────
     const STORE_KEY = 'hvt_data_v1';
+    const MV_CACHE_KEY = 'hvt_mv_cache_v1';
+    const MV_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
     const API_BASE = 'https://api2.heygen.com';
 
     // ── 语言 / 地区设置（按需修改，供不同地区用户使用）──────────────────────
@@ -24,7 +26,11 @@
     let pasteFilterIds = null; // null = off, Set = filter to these IDs
     let pasteFilterOrder = null; // Map<id, index> — preserves paste input order
     let showMissingOnly = false;
-    let isMinimized = false;
+    let isMinimized = true; // 默认最小化启动，避免每次页面加载就渲染全表
+    let tableRendered = false; // 首次展开面板时才渲染表格
+    const RENDER_CHUNK = 200; // 限量渲染：大列表先渲染前 N 行，点「加载更多」追加
+    let renderLimit = RENDER_CHUNK;
+    let lastFilterSig = '';
     let fetchInProgress = false;
     let fetchCancelled = false;
     let fetchPaused = false;
@@ -189,6 +195,11 @@
     let mvPlayingId = null; // currently playing voice id in my-voices panel
     let mvVoices = []; // cached my-voices list
     let mvSelectedIds = new Set(); // checked voices for batch download
+    let mvShareVoice = null; // voice currently targeted by the share dialog
+    let mvShareDone = []; // emails successfully shared in the current share-dialog session
+    let mvShareAbort = false; // set by 停止 to break the batch-remove loop
+    let mvShareWaitCancel = null; // cancels the in-progress inter-delete delay
+    let mainSelectedIds = new Set(); // checked voices in main table for download
 
     // ─── Storage ──────────────────────────────────────────────────────────────
     function loadDb() {
@@ -300,16 +311,9 @@
     // langFilter : 语言筛选值（如 'English'）；空字符串 = 不限语言（拉全量）
     // localeFilter: 地区筛选值（如 'en-US'）；客户端过滤，空 = 不限
     async function fetchAllVoices(onProgress, langFilter, localeFilter) {
-        // 只把本次目标范围内的声音先标为不存在，其它语言数据保留
         const filterLang = (langFilter || '').toLowerCase();
         const filterLocale = (localeFilter || '').toLowerCase();
-
-        for (const id in db.voices) {
-            const v = db.voices[id];
-            const langMatch = !filterLang || (v.language || '').toLowerCase() === filterLang;
-            const localeMatch = !filterLocale || (v.locale || '').toLowerCase() === filterLocale;
-            if (langMatch && localeMatch) v.existsOnHeygen = false;
-        }
+        const seenIds = new Set();
 
         let fetched = 0;
         let cursor = null;
@@ -335,6 +339,7 @@
                 if (filterLocale && (v.locale || '').toLowerCase() !== filterLocale) continue;
 
                 const id = v.voice_id;
+                seenIds.add(id);
                 const existing = db.voices[id] || {};
                 db.voices[id] = {
                     voice_id: id,
@@ -357,6 +362,16 @@
             cursor = (data.has_more && data.next_cursor) ? data.next_cursor : null;
             if (cursor) await new Promise(r => setTimeout(r, 120));
         } while (cursor);
+
+        // 仅在完整同步成功后才标记下架；中途终止 / 抛错不动旧状态，避免误标
+        if (!fetchCancelled) {
+            for (const id in db.voices) {
+                const v = db.voices[id];
+                const langMatch = !filterLang || (v.language || '').toLowerCase() === filterLang;
+                const localeMatch = !filterLocale || (v.locale || '').toLowerCase() === filterLocale;
+                if (langMatch && localeMatch && !seenIds.has(id)) v.existsOnHeygen = false;
+            }
+        }
 
         db.lastSync = Date.now();
         saveDb();
@@ -512,7 +527,8 @@
         }
 
         if (showMissingOnly) { list = list.filter(v => v.existsOnHeygen === false); return list; }
-        if (fLang) list = list.filter(v => (v.language || '').toLowerCase() === fLang);
+        // locale 比 language 更具体：选了 locale 时跳过 language 过滤，避免 language 字段缺失导致漏声音
+        if (fLang && !fLocale) list = list.filter(v => (v.language || '').toLowerCase() === fLang);
         if (fLocale) {
             const localeVals = selVals('hvt-f-locale', fLocale);
             list = list.filter(v => localeVals.includes((v.locale || '').trim().toLowerCase()));
@@ -925,15 +941,30 @@
         if (table) table.classList.toggle('hvt-no-desc', !showDesc);
 
         if (list.length === 0) {
-            tbody.innerHTML = `<tr><td colspan="11" class="hvt-empty">
+            tbody.innerHTML = `<tr><td colspan="7" class="hvt-empty">
                 <span class="hvt-empty-icon">${totalVoices === 0 ? '🎙' : '🔍'}</span>
                 ${totalVoices === 0 ? '暂无人声数据，请点击上方「获取/更新人声」按钮' : '没有符合条件的人声'}
             </td></tr>`;
             return;
         }
 
+        // 筛选条件变化时重置渲染上限；条件不变（如「加载更多」触发的重渲染）则保留
+        const sig = [
+            document.getElementById('hvt-search')?.value || '',
+            document.getElementById('hvt-f-lang')?.value || '',
+            document.getElementById('hvt-f-locale')?.value || '',
+            document.getElementById('hvt-f-gender')?.value || '',
+            document.getElementById('hvt-f-age')?.value || '',
+            [...selectedTags].join(','),
+            activeFilterMode,
+            pasteFilterIds ? pasteFilterIds.size : -1,
+            showMissingOnly,
+        ].join('|');
+        if (sig !== lastFilterSig) { lastFilterSig = sig; renderLimit = RENDER_CHUNK; }
+        const shown = list.slice(0, renderLimit);
+
         const frag = document.createDocumentFragment();
-        list.forEach((v, i) => {
+        shown.forEach((v) => {
             const tr = document.createElement('tr');
             if (!v.existsOnHeygen) tr.classList.add('hvt-row-missing');
             if (pasteFilterIds && activeFilterMode === 'paste' && pasteFilterIds.has((v.voice_id || '').toLowerCase())) {
@@ -947,8 +978,7 @@
             const genderClass = gender === 'female' ? 'hvt-f' : (gender === 'male' ? 'hvt-m' : '');
             const shortId = v.voice_id ? (v.voice_id.slice(0, 8) + '…') : '—';
             const previewUrl = v.preview_audio || '';
-            const statusIcon = v.existsOnHeygen !== false ? '✅' : '⚠️';
-            const statusTitle = v.existsOnHeygen !== false ? '在 HeyGen 中存在' : '此人声已从 HeyGen 下架或找不到';
+            const statusTitle = v.existsOnHeygen !== false ? esc(v.display_name || '') : '此人声已从 HeyGen 下架或找不到';
 
             const tagsHtml = (v.labels || [])
                 .map(t => `<span class="hvt-tag">${esc(t)}</span>`)
@@ -956,15 +986,13 @@
 
             // Play button (last column)
             tr.innerHTML = `
-                <td class="c-num">${i + 1}</td>
-                <td class="c-status" title="${statusTitle}">${statusIcon}</td>
-                <td class="c-country" title="${esc(localeCode)}（双击复制）">${esc(localeCode)}</td>
-                <td class="c-flag" title="${esc(localeCode)}">${flag}</td>
+                <td class="c-chk"><input type="checkbox" class="hvt-main-chk" data-id="${esc(v.voice_id)}"></td>
+                <td class="c-flag" title="${esc(localeCode)}（双击复制）" data-copy="${esc(localeCode)}">${flag} <span class="c-flag-code">${esc(localeCode)}</span></td>
                 <td class="c-gender"><span class="${genderClass}">${genderIcon}</span></td>
-                <td class="c-name" title="${esc(v.display_name)}（双击复制）">${esc(v.display_name || '—')}</td>
-                <td class="c-id" title="${esc(v.voice_id)}（双击复制完整 ID）" data-copy="${esc(v.voice_id)}">${esc(shortId)}</td>
-                <td class="c-combo" title="${esc((v.display_name || '').trim())}/${esc(v.voice_id)}（双击复制）" data-copy="${esc((v.display_name || '').trim() + '/' + (v.voice_id || ''))}">${esc((v.display_name || '').trim() + '/' + (v.voice_id ? v.voice_id.slice(0, 8) + '…' : ''))}</td>
-                <td class="c-desc" title="${esc(v.description)}（双击复制）">${esc(v.description || '')}</td>
+                <td class="c-name" title="${statusTitle}" data-copy="${esc((v.display_name || '') + '/' + (v.voice_id || ''))}">
+                    <div class="hvt-name-main">${esc(v.display_name || '—')}</div>
+                    <button class="hvt-copy-id-btn" data-copy="${esc((v.display_name || '') + '/' + (v.voice_id || ''))}" title="复制 名称/ID">${esc(shortId)}</button>
+                </td>
                 <td class="c-tags" title="双击复制标签">${tagsHtml}</td>
                 <td class="c-notes">
                     <input class="hvt-notes-input" data-id="${esc(v.voice_id)}"
@@ -983,6 +1011,9 @@
                                 <path d="M20 3v4m2-2h-4"/>
                             </svg>
                         </button>
+                        <button class="hvt-dl-one-btn hvt-btn" title="下载 MP3">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width:12px;height:12px"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                        </button>
                     </div>
                 </td>
             `;
@@ -991,6 +1022,32 @@
 
         tbody.innerHTML = '';
         tbody.appendChild(frag);
+
+        // 超出渲染上限时追加「加载更多 / 显示全部」行
+        if (list.length > shown.length) {
+            const moreTr = document.createElement('tr');
+            moreTr.className = 'hvt-load-more-row';
+            moreTr.innerHTML = `<td colspan="7" style="text-align:center;padding:10px">
+                <button id="hvt-load-more" class="hvt-btn">⬇ 加载更多（已显示 ${shown.length} / ${list.length}）</button>
+                <button id="hvt-load-all" class="hvt-btn">显示全部</button>
+            </td>`;
+            moreTr.querySelector('#hvt-load-more').addEventListener('click', (e) => {
+                e.stopPropagation();
+                renderLimit += RENDER_CHUNK;
+                renderTable();
+            });
+            moreTr.querySelector('#hvt-load-all').addEventListener('click', (e) => {
+                e.stopPropagation();
+                renderLimit = list.length;
+                renderTable();
+            });
+            tbody.appendChild(moreTr);
+        }
+        // Restore checkboxes for IDs still in selection (preserve selection across re-renders)
+        tbody.querySelectorAll('.hvt-main-chk').forEach(chk => {
+            if (mainSelectedIds.has(chk.dataset.id)) chk.checked = true;
+        });
+        mainUpdateSelectionUI();
 
         // Row click: select row (highlight) for Delete key support in paste-filter mode
         tbody.querySelectorAll('tr').forEach(tr => {
@@ -1022,28 +1079,6 @@
             btn.addEventListener('click', () => openVoiceDesign());
         });
 
-        // Double-click any cell to copy text (备注列不支持双击复制)
-        tbody.addEventListener('dblclick', async (e) => {
-            const td = e.target.closest('td');
-            if (!td) return;
-            if (td.classList.contains('c-notes')) return;
-            // Notes input: copy input value; other cells: copy text
-            const input = td.querySelector('.hvt-notes-input');
-            const copyVal = td.dataset.copy
-                ? td.dataset.copy                          // voice ID cell: copy full ID
-                : (input ? input.value : td.textContent.trim());
-            if (!copyVal) return;
-            try {
-                await navigator.clipboard.writeText(copyVal);
-                // Flash the cell to confirm copy
-                td.classList.add('hvt-copied');
-                setTimeout(() => td.classList.remove('hvt-copied'), 600);
-                showToast('✅ 已复制', 'success', 1200);
-            } catch (err) {
-                showToast('复制失败', 'error');
-            }
-        });
-
         // Notes inputs – save on change
         tbody.querySelectorAll('.hvt-notes-input').forEach(input => {
             input.addEventListener('change', () => {
@@ -1052,6 +1087,27 @@
                     db.voices[id].notes = input.value;
                     saveDb();
                 }
+            });
+        });
+
+        // Checkboxes for download selection
+        tbody.querySelectorAll('.hvt-main-chk').forEach(chk => {
+            chk.addEventListener('click', e => e.stopPropagation()); // prevent row-click handler
+            chk.addEventListener('change', () => {
+                const id = chk.dataset.id;
+                if (chk.checked) mainSelectedIds.add(id);
+                else mainSelectedIds.delete(id);
+                mainUpdateSelectionUI();
+            });
+        });
+
+        // Per-row download buttons
+        tbody.querySelectorAll('.hvt-dl-one-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const tr = btn.closest('tr');
+                const id = tr?.querySelector('.hvt-main-chk')?.dataset.id;
+                if (!id || !db.voices[id]) return;
+                mainDownloadOne(db.voices[id]);
             });
         });
     }
@@ -1308,6 +1364,173 @@
         mvStopAudio();
     }
 
+    // ─── Share Voice (batch email) ──────────────────────────────────────────────
+    function mvExtractEmails(text) {
+        const matches = (text || '').match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g) || [];
+        return [...new Set(matches)];
+    }
+
+    async function mvOpenShare(v) {
+        mvShareVoice = v;
+        mvShareDone = [];
+        const overlay = document.getElementById('hvt-mv-share-overlay');
+        if (!overlay) return;
+        const id = v.voice_id || '';
+        const name = v.display_name || id;
+        document.getElementById('hvt-mv-share-voice').innerHTML =
+            `共享声音：<b>${esc(name)}</b> <span style="color:#94a3b8">${esc(id.slice(0,8))}…</span>`;
+        const ta = document.getElementById('hvt-mv-share-ta');
+        const status = document.getElementById('hvt-mv-share-status');
+        if (ta) ta.value = '';
+        if (status) status.textContent = '';
+        mvShareRenderDone();
+        overlay.style.display = 'flex';
+        if (ta) ta.focus();
+
+        // 拉取该声音当前所有已共享邮箱（shared_resources 的键）
+        const section = document.getElementById('hvt-mv-share-done');
+        const countEl = document.getElementById('hvt-mv-share-done-count');
+        section.style.display = 'block';
+        countEl.textContent = '加载已共享邮箱…';
+        try {
+            const data = await heygenApi(`/v1/acl/voice/${encodeURIComponent(id)}`);
+            if (mvShareVoice !== v) return; // 弹框已关闭或切换
+            const existing = Object.keys(data?.shared_resources || {});
+            mvShareDone = [...new Set([...existing, ...mvShareDone])];
+            mvShareRenderDone();
+        } catch (e) {
+            if (mvShareVoice !== v) return;
+            if (!mvShareDone.length) countEl.textContent = '已共享邮箱加载失败';
+        }
+    }
+
+    function mvCloseShare() {
+        const overlay = document.getElementById('hvt-mv-share-overlay');
+        if (overlay) overlay.style.display = 'none';
+        mvShareVoice = null;
+        mvShareDone = [];
+    }
+
+    // Render the "本次已共享" list (highlighted) with per-row checkbox + delete
+    function mvShareRenderDone() {
+        const section = document.getElementById('hvt-mv-share-done');
+        const listEl = document.getElementById('hvt-mv-share-done-list');
+        if (!section || !listEl) return;
+
+        if (!mvShareDone.length) {
+            section.style.display = 'none';
+            listEl.innerHTML = '';
+            return;
+        }
+        section.style.display = 'block';
+        document.getElementById('hvt-mv-share-done-count').textContent = `已共享 ${mvShareDone.length} 个`;
+
+        listEl.innerHTML = '';
+        const frag = document.createDocumentFragment();
+        mvShareDone.forEach(email => {
+            const row = document.createElement('div');
+            row.className = 'hvt-mv-share-done-row';
+            row.innerHTML = `
+                <input type="checkbox" class="hvt-mv-share-cb">
+                <span class="hvt-mv-share-email" title="${esc(email)}">${esc(email)}</span>
+                <button class="hvt-mv-share-del hvt-btn" title="取消共享">✕</button>
+            `;
+            row.querySelector('.hvt-mv-share-del').addEventListener('click', () => mvShareRemove([email]));
+            frag.appendChild(row);
+        });
+        listEl.appendChild(frag);
+        const selAll = document.getElementById('hvt-mv-share-selall');
+        if (selAll) selAll.checked = false;
+    }
+
+    async function mvShareGo() {
+        if (!mvShareVoice) return;
+        const ta = document.getElementById('hvt-mv-share-ta');
+        const status = document.getElementById('hvt-mv-share-status');
+        const btn = document.getElementById('hvt-mv-share-go');
+        const emails = mvExtractEmails(ta.value).filter(e => !mvShareDone.includes(e));
+
+        if (!emails.length) { status.textContent = '⚠️ 未检测到有效邮箱（或都已共享）'; return; }
+
+        const voiceId = mvShareVoice.voice_id || '';
+        btn.disabled = true;
+        let shared = 0, failed = 0;
+
+        for (let i = 0; i < emails.length; i++) {
+            status.textContent = `共享中 ${i + 1}/${emails.length}…`;
+            try {
+                await heygenApi('/v1/share_resources', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        resource_type: 'VOICE',
+                        resource_id: voiceId,
+                        destination_email_address: emails[i],
+                    }),
+                });
+                shared++;
+                mvShareDone.push(emails[i]);
+                mvShareRenderDone();
+            } catch (e) {
+                failed++;
+            }
+            // 4~8 秒随机延迟，避免操作太快被服务器拒绝
+            if (i < emails.length - 1) await new Promise(r => setTimeout(r, 4000 + Math.random() * 4000));
+        }
+
+        status.textContent = failed > 0 ? `✅ 已共享 ${shared} 个，${failed} 个失败` : `✅ 已共享 ${shared} 个`;
+        if (shared > 0) ta.value = '';
+        btn.disabled = false;
+    }
+
+    // 可被「停止」立即打断的等待
+    function mvShareSleep(ms) {
+        return new Promise(resolve => {
+            const t = setTimeout(() => { mvShareWaitCancel = null; resolve(); }, ms);
+            mvShareWaitCancel = () => { clearTimeout(t); mvShareWaitCancel = null; resolve(); };
+        });
+    }
+
+    // Un-share one or more emails (used by single ✕ and 删除选中)
+    async function mvShareRemove(emails) {
+        if (!mvShareVoice || !emails.length) return;
+        const voiceId = mvShareVoice.voice_id || '';
+        const status = document.getElementById('hvt-mv-share-done-status');
+        const delBtn = document.getElementById('hvt-mv-share-delsel');
+        const stopBtn = document.getElementById('hvt-mv-share-stop');
+        mvShareAbort = false;
+        if (delBtn) delBtn.disabled = true;
+        if (stopBtn && emails.length > 1) stopBtn.style.display = 'inline-flex';
+
+        let removed = 0, failed = 0;
+        for (let i = 0; i < emails.length; i++) {
+            if (mvShareAbort) break;
+            if (status) status.textContent = `删除中 ${i + 1}/${emails.length}…`;
+            try {
+                await heygenApi('/v1/share_resources/remove', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        resource_type: 'VOICE',
+                        resource_id: voiceId,
+                        destination_email_address: emails[i],
+                    }),
+                });
+                mvShareDone = mvShareDone.filter(e => e !== emails[i]);
+                removed++;
+                mvShareRenderDone();
+            } catch (e) {
+                failed++;
+            }
+            if (i < emails.length - 1 && !mvShareAbort) await mvShareSleep(4000 + Math.random() * 4000);
+        }
+
+        if (stopBtn) stopBtn.style.display = 'none';
+        if (delBtn) delBtn.disabled = false;
+        if (status) {
+            const tail = mvShareAbort ? '（已停止）' : '';
+            status.textContent = (failed > 0 ? `已取消 ${removed} 个，${failed} 个失败` : `已取消 ${removed} 个`) + tail;
+        }
+    }
+
     function mvStopAudio() {
         if (mvAudioEl) { try { mvAudioEl.pause(); } catch (e) { } mvAudioEl = null; }
         if (mvPlayingId) {
@@ -1396,8 +1619,10 @@
             a.click();
             document.body.removeChild(a);
             setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+            return true;
         } catch (e) {
             showToast(`下载「${name}」失败: ${e.message}`, 'error', 4000);
+            return false;
         }
     }
 
@@ -1412,11 +1637,9 @@
         if (activeBtn) activeBtn.disabled = true;
         let done = 0, failed = 0;
         for (const v of pool) {
-            if (activeBtn) activeBtn.textContent = `下载中 ${done + 1}/${pool.length}…`;
-            try {
-                await mvDownloadOne(v);
-                done++;
-            } catch { failed++; }
+            if (activeBtn) activeBtn.textContent = `下载中 ${done + failed + 1}/${pool.length}…`;
+            if (await mvDownloadOne(v)) done++;
+            else failed++;
             await new Promise(r => setTimeout(r, 700));
         }
         if (dlAllBtn) { dlAllBtn.disabled = false; dlAllBtn.textContent = '⬇ 全部下载'; }
@@ -1424,6 +1647,52 @@
         showToast(failed > 0
             ? `完成：${done} 成功，${failed} 失败`
             : `✅ 已下载 ${done} 个音频`, 'success', 3000);
+    }
+
+    function mainUpdateSelectionUI() {
+        const bar = document.getElementById('hvt-dl-bar');
+        const info = document.getElementById('hvt-dl-bar-info');
+        if (!bar) return;
+        const n = mainSelectedIds.size;
+        bar.style.display = n > 0 ? 'flex' : 'none';
+        if (info) info.textContent = `已选 ${n} 条`;
+    }
+
+    async function mainDownloadOne(v) {
+        const name = (v.display_name || v.voice_id || 'voice').replace(/[\\/:*?"<>|]/g, '_');
+        try {
+            const audioBytes = await mvStreamPreview(v.voice_id, v.language || 'English');
+            const blob = new Blob([audioBytes], { type: 'audio/mpeg' });
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = `${name}.mp3`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+            return true;
+        } catch (e) {
+            showToast(`下载「${name}」失败: ${e.message}`, 'error', 4000);
+            return false;
+        }
+    }
+
+    async function mainDownloadSelected() {
+        const ids = [...mainSelectedIds];
+        if (ids.length === 0) { showToast('请先勾选要下载的人声', 'error'); return; }
+        const pool = ids.map(id => db.voices[id]).filter(Boolean);
+        const btn = document.getElementById('hvt-dl-bar-btn');
+        if (btn) btn.disabled = true;
+        let done = 0, failed = 0;
+        for (const v of pool) {
+            if (btn) btn.textContent = `下载中 ${done + failed + 1}/${pool.length}…`;
+            if (await mainDownloadOne(v)) done++;
+            else failed++;
+            await new Promise(r => setTimeout(r, 500));
+        }
+        if (btn) { btn.disabled = false; btn.textContent = '⬇ 下载已选'; }
+        showToast(failed > 0 ? `完成：${done} 成功，${failed} 失败` : `✅ 已下载 ${done} 个音频`, 'success', 3000);
     }
 
     function mvUpdateSelectionUI() {
@@ -1436,23 +1705,45 @@
         if (selCountEl) selCountEl.textContent = n > 0 ? `已选 ${n} 个` : '';
     }
 
+    // default_voice_engine → 展示用标签（短名 / 全名 / 配色 class）
+    function mvEngineInfo(e) {
+        switch ((e || '').trim()) {
+            case 'elevenLabsV3': return { short: '11Labs v3', full: 'ElevenLabs v3', cls: 'eng-elv3' };
+            case 'elevenLabs':   return { short: '11Labs',    full: 'ElevenLabs',    cls: 'eng-el' };
+            case 'panda':        return { short: 'Panda',     full: 'Panda',         cls: 'eng-panda' };
+            case 'fish':         return { short: 'Fish',      full: 'Fish',          cls: 'eng-fish' };
+            case 'auto':         return { short: 'Auto',      full: 'Auto（自动选择）', cls: 'eng-auto' };
+            default: return e ? { short: e, full: e, cls: 'eng-auto' } : null;
+        }
+    }
+
     function mvRenderList() {
         const listEl = document.getElementById('hvt-mv-list');
         if (!listEl) return;
-        if (mvVoices.length === 0) {
-            listEl.innerHTML = '<div class="hvt-mv-empty">没有找到声音</div>';
+
+        const q = (document.getElementById('hvt-mv-search')?.value || '').toLowerCase().trim();
+        const visible = q
+            ? mvVoices.filter(v => (v.display_name || '').toLowerCase().includes(q) || (v.voice_id || '').toLowerCase().includes(q))
+            : mvVoices;
+
+        const countEl = document.getElementById('hvt-mv-count');
+        if (countEl) countEl.textContent = q ? `显示 ${visible.length} / 共 ${mvVoices.length} 个` : `共 ${mvVoices.length} 个声音`;
+
+        if (visible.length === 0) {
+            listEl.innerHTML = `<div class="hvt-mv-empty">${mvVoices.length === 0 ? '没有找到声音' : '无匹配结果'}</div>`;
             return;
         }
         listEl.innerHTML = '';
         mvSelectedIds.clear();
         mvUpdateSelectionUI();
         const frag = document.createDocumentFragment();
-        mvVoices.forEach(v => {
+        visible.forEach(v => {
             const id = v.voice_id || '';
             const name = v.display_name || id;
             const gender = (v.gender || '').toLowerCase();
             const genderIcon = gender === 'female' ? '♀' : (gender === 'male' ? '♂' : '');
             const lang = v.language || '';
+            const eng = mvEngineInfo(v.default_voice_engine);
 
             const row = document.createElement('div');
             row.className = 'hvt-mv-row';
@@ -1466,6 +1757,10 @@
                 <span class="hvt-mv-name" title="${esc(name)}">${esc(name)}</span>
                 ${genderIcon ? `<span class="hvt-mv-gender ${gender === 'female' ? 'hvt-f' : 'hvt-m'}">${genderIcon}</span>` : ''}
                 ${lang ? `<span class="hvt-mv-locale">${esc(lang)}</span>` : ''}
+                ${eng ? `<span class="hvt-mv-engine ${eng.cls}" title="引擎: ${esc(eng.full)}">${esc(eng.short)}</span>` : ''}
+                <span class="hvt-mv-id" title="${esc(id)}">${esc(id.slice(0,8))}…</span>
+                <button class="hvt-mv-copy-btn hvt-btn" data-id="${esc(id)}" title="复制 Voice ID">复制ID</button>
+                <button class="hvt-mv-share-btn hvt-btn" title="共享给团队成员（批量邮箱）">🔗 共享</button>
                 <button class="hvt-mv-dl-btn hvt-btn" title="下载 MP3">⬇</button>
             `;
             const chk = row.querySelector('.hvt-mv-chk');
@@ -1475,18 +1770,59 @@
                 mvUpdateSelectionUI();
             });
             row.querySelector('.hvt-mv-play-btn').addEventListener('click', () => mvTogglePlay(v));
+            row.querySelector('.hvt-mv-copy-btn').addEventListener('click', e => {
+                navigator.clipboard.writeText(id).then(() => {
+                    const btn = e.currentTarget;
+                    const orig = btn.textContent;
+                    btn.textContent = '已复制';
+                    setTimeout(() => { btn.textContent = orig; }, 1200);
+                });
+            });
+            row.querySelector('.hvt-mv-share-btn').addEventListener('click', () => mvOpenShare(v));
             row.querySelector('.hvt-mv-dl-btn').addEventListener('click', () => mvDownloadOne(v));
             frag.appendChild(row);
         });
         listEl.appendChild(frag);
     }
 
-    async function mvLoadVoices() {
+    function mvReadCache() {
+        try {
+            const raw = localStorage.getItem(MV_CACHE_KEY);
+            if (!raw) return null;
+            const c = JSON.parse(raw);
+            if (!c || !Array.isArray(c.voices) || typeof c.ts !== 'number') return null;
+            return c;
+        } catch { return null; }
+    }
+
+    function mvCacheAgeText(ts) {
+        const min = Math.floor((Date.now() - ts) / 60000);
+        if (min < 1) return '刚刚';
+        if (min < 60) return `${min} 分钟前`;
+        const h = Math.floor(min / 60);
+        return h < 24 ? `${h} 小时前` : `${Math.floor(h / 24)} 天前`;
+    }
+
+    async function mvLoadVoices(force = false) {
         const statusEl = document.getElementById('hvt-mv-status');
         const listEl   = document.getElementById('hvt-mv-list');
         const countEl  = document.getElementById('hvt-mv-count');
         const dlAllBtn = document.getElementById('hvt-mv-dl-all');
         if (!listEl) return;
+
+        // 命中未过期缓存 → 秒开
+        if (!force) {
+            const c = mvReadCache();
+            if (c && Date.now() - c.ts < MV_CACHE_TTL) {
+                mvVoices = c.voices;
+                if (dlAllBtn) dlAllBtn.disabled = false;
+                if (statusEl) statusEl.textContent = `📦 缓存于 ${mvCacheAgeText(c.ts)} · 点「↺ 刷新」更新`;
+                const searchEl = document.getElementById('hvt-mv-search');
+                if (searchEl) searchEl.value = '';
+                mvRenderList();
+                return;
+            }
+        }
 
         if (statusEl) statusEl.textContent = '加载中…';
         if (dlAllBtn) dlAllBtn.disabled = true;
@@ -1494,24 +1830,30 @@
         mvVoices = [];
 
         try {
-            // Fetch all pages from confirmed endpoint
+            // Fetch all pages using next_token param (verified working param name).
+            // API returns page 1 again when exhausted, so use voice_id dedup as real terminator.
             let allVoices = [];
-            let page = 1;
-            while (true) {
-                const data = await heygenApi(
-                    `/v2/pacific/voice_clone/voice.list?page_size=50&page=${page}`
-                );
-                // Response shape: heygenApi strips outer .data → { data:[...], total?, has_more? }
+            let seenIds = new Set();
+            let nextToken = null;
+            for (let page = 0; page < 20; page++) {
+                let url = `/v2/pacific/voice_clone/voice.list?page_size=50`;
+                if (nextToken) url += `&next_token=${encodeURIComponent(nextToken)}`;
+                const data = await heygenApi(url);
                 const list = data.data || data.list || data.voices || [];
-                allVoices = allVoices.concat(list);
-                if (!data.has_more || list.length === 0 || list.length < 50) break;
-                page++;
+                const fresh = list.filter(v => v.voice_id && !seenIds.has(v.voice_id));
+                if (fresh.length === 0) break;
+                fresh.forEach(v => seenIds.add(v.voice_id));
+                allVoices = allVoices.concat(fresh);
+                nextToken = data.next_pagination_token || null;
+                if (!nextToken) break;
             }
 
             mvVoices = allVoices;
+            try { localStorage.setItem(MV_CACHE_KEY, JSON.stringify({ ts: Date.now(), voices: allVoices })); } catch {}
             if (statusEl) statusEl.textContent = '';
-            if (countEl) countEl.textContent = `共 ${allVoices.length} 个声音`;
             if (dlAllBtn) dlAllBtn.disabled = false;
+            const searchEl = document.getElementById('hvt-mv-search');
+            if (searchEl) searchEl.value = '';
             mvRenderList();
         } catch (e) {
             if (statusEl) statusEl.textContent = '加载失败: ' + e.message;
@@ -1543,6 +1885,7 @@
 
         const root = document.createElement('div');
         root.id = 'hvt-root';
+        root.classList.add('hvt-minimized'); // 默认最小化，点 FAB 展开
         root.innerHTML = `
 <div id="hvt-modal">
 
@@ -1600,19 +1943,19 @@
     </div>
   </div>
 
+  <div id="hvt-dl-bar">
+    <span id="hvt-dl-bar-info"></span>
+    <button id="hvt-dl-bar-btn" class="hvt-btn hvt-btn-primary">⬇ 下载已选</button>
+    <button id="hvt-dl-bar-clear" class="hvt-btn">✕ 清除</button>
+  </div>
   <div id="hvt-table-wrap">
     <table id="hvt-table">
       <thead>
         <tr>
-          <th class="c-num">#</th>
-          <th class="c-status" data-col="c-status" title="双击复制整列">状态</th>
-          <th class="c-country" data-col="c-country" title="双击复制整列">国家 / 地区</th>
-          <th class="c-flag">国旗</th>
+          <th class="c-chk"><input type="checkbox" id="hvt-chk-all" title="全选当前页"></th>
+          <th class="c-flag" data-col="c-flag" title="双击复制整列">地区</th>
           <th class="c-gender" data-col="c-gender" title="双击复制整列">性别</th>
-          <th class="c-name" data-col="c-name" title="双击复制整列">人声名称</th>
-          <th class="c-id" data-col="c-id" title="双击复制整列">人声ID</th>
-          <th class="c-combo" data-col="c-combo" title="双击复制整列">人声名称/人声ID</th>
-          <th class="c-desc" data-col="c-desc" title="双击复制整列">人声介绍</th>
+          <th class="c-name" data-col="c-name" title="双击复制整列">人声名称 / ID</th>
           <th class="c-tags" data-col="c-tags" title="双击复制整列">属性标签</th>
           <th class="c-notes" data-col="c-notes" title="双击复制整列">备注</th>
           <th class="c-play">操作</th>
@@ -1678,11 +2021,48 @@
                   <button id="hvt-mv-close" title="关闭">✕</button>
                 </div>
               </div>
-              <div id="hvt-mv-status" style="padding:6px 16px;font-size:13px;color:#8b8abf"></div>
+              <div style="padding:8px 16px 4px">
+                <input id="hvt-mv-search" class="hvt-input" placeholder="搜索声音名称 / ID…" style="width:100%;box-sizing:border-box">
+              </div>
+              <div id="hvt-mv-status" style="padding:2px 16px 6px;font-size:13px;color:#8b8abf"></div>
               <div id="hvt-mv-list"></div>
             </div>
         `;
         document.body.appendChild(mvRoot);
+
+        // Share Voice modal (batch email)
+        const shareRoot = document.createElement('div');
+        shareRoot.id = 'hvt-mv-share-overlay';
+        shareRoot.style.display = 'none';
+        shareRoot.innerHTML = `
+            <div id="hvt-mv-share-panel">
+              <div id="hvt-mv-share-header">
+                <span id="hvt-mv-share-title">🔗 共享声音给团队成员</span>
+                <button id="hvt-mv-share-close" title="关闭">✕</button>
+              </div>
+              <div id="hvt-mv-share-body">
+                <div id="hvt-mv-share-voice"></div>
+                <textarea id="hvt-mv-share-ta"
+                  placeholder="批量添加：每行一个邮箱（或用逗号 / 空格分隔）"></textarea>
+                <div id="hvt-mv-share-actions">
+                  <button id="hvt-mv-share-go" class="hvt-btn hvt-btn-primary">批量共享</button>
+                  <span id="hvt-mv-share-status"></span>
+                </div>
+                <div id="hvt-mv-share-done" style="display:none">
+                  <div id="hvt-mv-share-done-bar">
+                    <input type="checkbox" id="hvt-mv-share-selall">
+                    <label for="hvt-mv-share-selall">全选</label>
+                    <span id="hvt-mv-share-done-count"></span>
+                    <button id="hvt-mv-share-delsel" class="hvt-btn hvt-btn-danger">删除选中</button>
+                    <button id="hvt-mv-share-stop" class="hvt-btn" style="display:none">■ 停止</button>
+                    <span id="hvt-mv-share-done-status"></span>
+                  </div>
+                  <div id="hvt-mv-share-done-list"></div>
+                </div>
+              </div>
+            </div>
+        `;
+        document.body.appendChild(shareRoot);
 
         bindEvents();
         updateSyncInfo();
@@ -1699,11 +2079,51 @@
             );
             if (match) localeEl.value = match.value;
         }
-        renderTable();
+        // 首屏不渲染表格（默认最小化），首次展开面板时再渲染
     }
 
     // ─── Event binding ────────────────────────────────────────────────────────
     function bindEvents() {
+        // tbody 是常驻元素，复制类监听器只能绑一次（renderTable 里绑会随重渲染累积）
+        const tbodyEl = document.getElementById('hvt-tbody');
+
+        // Click on voice ID copy button
+        tbodyEl.addEventListener('click', async (e) => {
+            const btn = e.target.closest('.hvt-copy-id-btn');
+            if (!btn) return;
+            const id = btn.dataset.copy;
+            if (!id) return;
+            try {
+                await navigator.clipboard.writeText(id);
+                const orig = btn.textContent;
+                btn.textContent = '已复制!';
+                btn.classList.add('hvt-copied');
+                setTimeout(() => { btn.textContent = orig; btn.classList.remove('hvt-copied'); }, 1200);
+            } catch (err) { showToast('复制失败', 'error'); }
+        });
+
+        // Double-click any cell to copy text (备注列不支持双击复制)
+        tbodyEl.addEventListener('dblclick', async (e) => {
+            const td = e.target.closest('td');
+            if (!td) return;
+            if (td.classList.contains('c-notes')) return;
+            // Notes input: copy input value; other cells: copy text
+            const input = td.querySelector('.hvt-notes-input');
+            const copyVal = td.dataset.copy
+                ? td.dataset.copy                          // voice ID cell: copy full ID
+                : (input ? input.value : td.textContent.trim());
+            if (!copyVal) return;
+            try {
+                await navigator.clipboard.writeText(copyVal);
+                // Flash the cell to confirm copy
+                td.classList.add('hvt-copied');
+                setTimeout(() => td.classList.remove('hvt-copied'), 600);
+                showToast('✅ 已复制', 'success', 1200);
+            } catch (err) {
+                showToast('复制失败', 'error');
+            }
+        });
+
         // Double-click table header → copy entire column data
         document.querySelector('#hvt-table thead tr').addEventListener('dblclick', e => {
             const th = e.target.closest('th[data-col]');
@@ -1740,6 +2160,11 @@
             const root = document.getElementById('hvt-root');
             isMinimized = !isMinimized;
             root.classList.toggle('hvt-minimized', isMinimized);
+            if (!isMinimized) {
+                if (!tableRendered) { renderTable(); tableRendered = true; }
+                const wrap = document.getElementById('hvt-table-wrap');
+                if (wrap) wrap.scrollLeft = 0;
+            }
         });
 
         document.getElementById('hvt-fab-vd').addEventListener('click', () => {
@@ -1993,14 +2418,57 @@
             if (e.target === document.getElementById('hvt-vd-overlay')) closeVoiceDesign();
         });
 
+        // Main table: select-all checkbox
+        document.getElementById('hvt-chk-all').addEventListener('change', (e) => {
+            const tb = document.getElementById('hvt-tbody');
+            const checked = e.target.checked;
+            if (!checked) mainSelectedIds.clear();
+            tb.querySelectorAll('.hvt-main-chk').forEach(chk => {
+                chk.checked = checked;
+                if (checked) mainSelectedIds.add(chk.dataset.id);
+            });
+            mainUpdateSelectionUI();
+        });
+        document.getElementById('hvt-dl-bar-btn').addEventListener('click', mainDownloadSelected);
+        document.getElementById('hvt-dl-bar-clear').addEventListener('click', () => {
+            mainSelectedIds.clear();
+            document.getElementById('hvt-tbody').querySelectorAll('.hvt-main-chk').forEach(c => c.checked = false);
+            const chkAll = document.getElementById('hvt-chk-all');
+            if (chkAll) chkAll.checked = false;
+            mainUpdateSelectionUI();
+        });
+
         // My Voices modal
         document.getElementById('hvt-btn-my-voices').addEventListener('click', openMyVoices);
         document.getElementById('hvt-mv-close').addEventListener('click', closeMyVoices);
-        document.getElementById('hvt-mv-refresh').addEventListener('click', mvLoadVoices);
+        document.getElementById('hvt-mv-refresh').addEventListener('click', () => mvLoadVoices(true));
+        document.getElementById('hvt-mv-search').addEventListener('input', mvRenderList);
         document.getElementById('hvt-mv-dl-all').addEventListener('click', mvDownloadSelected);
         document.getElementById('hvt-mv-dl-sel').addEventListener('click', mvDownloadSelected);
         document.getElementById('hvt-mv-overlay').addEventListener('click', (e) => {
             if (e.target === document.getElementById('hvt-mv-overlay')) closeMyVoices();
+        });
+
+        // Share Voice modal
+        document.getElementById('hvt-mv-share-close').addEventListener('click', mvCloseShare);
+        document.getElementById('hvt-mv-share-go').addEventListener('click', mvShareGo);
+        document.getElementById('hvt-mv-share-overlay').addEventListener('click', (e) => {
+            if (e.target === document.getElementById('hvt-mv-share-overlay')) mvCloseShare();
+        });
+        document.getElementById('hvt-mv-share-selall').addEventListener('change', (e) => {
+            document.querySelectorAll('#hvt-mv-share-done-list .hvt-mv-share-cb')
+                .forEach(cb => { cb.checked = e.target.checked; });
+        });
+        document.getElementById('hvt-mv-share-delsel').addEventListener('click', () => {
+            const rows = [...document.querySelectorAll('#hvt-mv-share-done-list .hvt-mv-share-done-row')];
+            const emails = rows
+                .filter(r => r.querySelector('.hvt-mv-share-cb').checked)
+                .map(r => r.querySelector('.hvt-mv-share-email').textContent);
+            if (emails.length) mvShareRemove(emails);
+        });
+        document.getElementById('hvt-mv-share-stop').addEventListener('click', () => {
+            mvShareAbort = true;
+            if (mvShareWaitCancel) mvShareWaitCancel();
         });
     }
 
@@ -2016,3 +2484,6 @@
         init();
     }
 })();
+
+// Share Voice 弹框增强（批量添加邮箱 + 批量删除）
+proc11ShareVoice.init();

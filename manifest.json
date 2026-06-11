@@ -18,6 +18,7 @@
                 "https://app.heygen.com/*"
             ],
             "js": [
+                "proc11ShareVoice.js",
                 "content.js"
             ],
             "css": [
