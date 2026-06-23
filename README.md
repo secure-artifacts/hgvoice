@@ -61,6 +61,23 @@
 
 ---
 
+### 四、AI Studio 快速换声音
+
+在 AI Studio（`/create-v4/`）和 Avatar Shots（`/avatar/avatar-shots`）中，无需手动打开 Switch 弹窗，直接通过插件面板搜索并切换当前场景的声音。
+
+**使用方式**
+- 在插件浮窗中切换到「AI Studio 换声音」标签
+- 输入 Voice ID 或搜索声音名称，点击对应行即自动切换
+- 切换后面板显示 ✅ 结果，AI Studio 右侧面板同步更新
+
+**技术特性**
+- 通过 MAIN world 内容脚本（`ais-bridge.js`）读取 React Fiber，直接调用页面内部 `onSelect` 回调，完全绕过 UI 操作
+- **绕过「See More」分页限制**：预先通过 API 拉取全量「我的声音」缓存，切换时无论目标声音是否渲染在弹窗内，均可直接命中
+- **AI Studio**：自动处理 Avatar & Voice → Edit Voice → Switch 的导航链路，打开面板即可直接使用
+- **Avatar Shots**：自动完成 Voice 按钮 → Switch → 选择 → Save changes 的完整流程
+
+---
+
 ## 安装方法
 
 1. 下载或克隆本仓库
@@ -81,6 +98,13 @@
 ---
 
 ## 版本记录
+
+### v1.5.0
+- **新增 AI Studio 快速换声音面板**：在 AI Studio 和 Avatar Shots 页面可直接搜索并切换当前场景声音，无需手动操作 Switch 弹窗
+- **绕过「See More」分页**：通过 API 预拉全量「我的声音」并缓存，切换时不受弹窗渲染限制
+- **新增 `ais-bridge.js`**：以 MAIN world 内容脚本运行，通过 React Fiber 直接调用 `onSelect` 回调
+- **Avatar Shots 支持**：自动处理 Voice 弹窗 → Switch → Save changes 完整流程
+- **AI Studio**：自动处理 Avatar & Voice 面板导航，无需手动进入 Edit Voice
 
 ### v1.4.0
 - **我的声音**：修复播放和下载（改用流式接口，解决 CORS 403 问题）

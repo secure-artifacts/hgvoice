@@ -1861,6 +1861,269 @@
         }
     }
 
+    // Silently populate mvVoices from API without needing My Voices panel DOM.
+    // Called in background when AIS panel opens so voiceObj is available for capturedOnSelect fallback.
+    async function mvEnsureCache() {
+        const c = mvReadCache();
+        if (c && Date.now() - c.ts < MV_CACHE_TTL) {
+            if (mvVoices.length === 0) mvVoices = c.voices;
+            return;
+        }
+        try {
+            let allVoices = [], seenIds = new Set(), nextToken = null;
+            for (let page = 0; page < 20; page++) {
+                let url = `/v2/pacific/voice_clone/voice.list?page_size=50`;
+                if (nextToken) url += `&next_token=${encodeURIComponent(nextToken)}`;
+                const data = await heygenApi(url);
+                const list = data.data || data.list || data.voices || [];
+                const fresh = list.filter(v => v.voice_id && !seenIds.has(v.voice_id));
+                if (fresh.length === 0) break;
+                fresh.forEach(v => seenIds.add(v.voice_id));
+                allVoices = allVoices.concat(fresh);
+                nextToken = data.next_pagination_token || null;
+                if (!nextToken) break;
+            }
+            mvVoices = allVoices;
+            try { localStorage.setItem(MV_CACHE_KEY, JSON.stringify({ ts: Date.now(), voices: allVoices })); } catch {}
+        } catch {}
+    }
+
+    // ─── AI Studio Quick Voice Switch ────────────────────────────────────────
+    let aisSearchResults = [];
+
+    // aisIsModalOpen: detects both AI Studio "Select Voice" and Avatar Shots "Choose avatar voice"
+    function aisIsModalOpen() {
+        return !![...document.querySelectorAll('[role="dialog"]')]
+            .find(d => d.textContent.includes('Select Voice') || d.textContent.includes('Choose avatar voice'));
+    }
+
+    // On Avatar Shots, the Voice toolbar button has an #audio svg icon
+    function aisFindAvatarShotsVoiceBtn() {
+        return [...document.querySelectorAll('button')]
+            .filter(b => !b.closest('#hvt-root') && !b.closest('#hvt-fab-strip'))
+            .find(b => b.querySelector('svg use[href="#audio"]'));
+    }
+
+    // aisBridgeSwitch: asks ais-bridge.js (MAIN world) to call onSelect via CustomEvent.
+    // Passes full voiceObj so bridge can switch even if the voice isn't rendered in the modal.
+    function aisBridgeSwitch(targetVoiceId) {
+        const voiceObj = mvVoices.find(v => v.voice_id === targetVoiceId) || db.voices[targetVoiceId] || null;
+        return new Promise((resolve) => {
+            const handler = (e) => {
+                document.removeEventListener('hvt-ais-result', handler);
+                clearTimeout(timer);
+                resolve(e.detail);
+            };
+            const timer = setTimeout(() => {
+                document.removeEventListener('hvt-ais-result', handler);
+                resolve({ success: false });
+            }, 5000);
+            document.addEventListener('hvt-ais-result', handler);
+            document.dispatchEvent(new CustomEvent('hvt-ais-switch', { detail: { id: targetVoiceId, voiceObj } }));
+        });
+    }
+
+    async function aisQuickSwitch(targetVoiceId) {
+        const statusEl = document.getElementById('hvt-ais-status');
+        const setStatus = (msg, type = '') => {
+            if (!statusEl) return;
+            statusEl.textContent = msg;
+            statusEl.dataset.type = type;
+        };
+
+        const isAvatarShots = location.pathname.includes('/avatar/');
+        const isAIStudio   = location.pathname.includes('/create-v4/');
+        if (!isAvatarShots && !isAIStudio) {
+            setStatus('请在 AI Studio 或 Avatar Shots 页面使用', 'error');
+            return;
+        }
+
+        setStatus('正在打开切换窗口…');
+
+        if (!aisIsModalOpen()) {
+            if (isAvatarShots) {
+                // Avatar Shots: click Voice toolbar button (#audio icon) → Voice modal → Switch
+                const voiceToolbarBtn = aisFindAvatarShotsVoiceBtn();
+                if (!voiceToolbarBtn) {
+                    setStatus('未找到 Voice 按钮，请确认当前在 Avatar Shots 页面', 'error');
+                    return;
+                }
+                voiceToolbarBtn.click();
+                await new Promise(r => setTimeout(r, 400));
+                // Now find the Switch → button inside the Voice modal
+                const switchInModal = [...document.querySelectorAll('[role="dialog"] button')]
+                    .find(b => b.textContent.includes('Switch'));
+                if (!switchInModal) {
+                    setStatus('Voice 弹窗未出现，请重试', 'error');
+                    return;
+                }
+                switchInModal.click();
+            } else {
+                // AI Studio: find Switch button directly, or navigate from Avatar & Voice panel
+                let heySwitchBtn = [...document.querySelectorAll('button')]
+                    .filter(b => !b.closest('#hvt-fab-strip') && !b.closest('#hvt-root') && !b.closest('#hvt-ais-overlay'))
+                    .find(b => b.textContent.trim() === 'Switch');
+
+                if (!heySwitchBtn) {
+                    // Voice row has no <img> (avatar row does); both share tw-cursor-pointer + tw-rounded-md
+                    const voiceRow = [...document.querySelectorAll('div.tw-cursor-pointer')]
+                        .filter(el => !el.closest('#hvt-root') && !el.closest('#hvt-fab-strip') &&
+                            el.className.includes('tw-rounded-md') && el.className.includes('tw-border'))
+                        .find(el => !el.querySelector('img'));
+                    if (voiceRow) {
+                        voiceRow.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                        await new Promise(r => setTimeout(r, 400));
+                        heySwitchBtn = [...document.querySelectorAll('button')]
+                            .filter(b => !b.closest('#hvt-fab-strip') && !b.closest('#hvt-root') && !b.closest('#hvt-ais-overlay'))
+                            .find(b => b.textContent.trim() === 'Switch');
+                    }
+                }
+
+                if (!heySwitchBtn) {
+                    setStatus('未找到 Switch 按钮，请先在 AI Studio 选中 Avatar 场景', 'error');
+                    return;
+                }
+                heySwitchBtn.click();
+            }
+
+            let waited = 0;
+            while (!aisIsModalOpen() && waited < 4000) {
+                await new Promise(r => setTimeout(r, 150));
+                waited += 150;
+            }
+            if (!aisIsModalOpen()) {
+                setStatus('切换窗口未能打开，请重试', 'error');
+                return;
+            }
+            await new Promise(r => setTimeout(r, 400));
+        }
+
+        setStatus('正在切换声音…');
+
+        // Try current (first) tab — bridge handles modal search internally if needed
+        let result = await aisBridgeSwitch(targetVoiceId);
+
+        // If not found, iterate remaining tabs
+        if (!result.success) {
+            for (const tabLabel of ['My voices', 'HeyGen library']) {
+                const tab = [...document.querySelectorAll('[role="tab"], button')]
+                    .filter(el => !el.closest('#hvt-ais-overlay') && !el.closest('#hvt-fab-strip') && !el.closest('#hvt-root'))
+                    .find(el => el.textContent.trim() === tabLabel);
+                if (!tab) continue;
+                tab.click();
+                await new Promise(r => setTimeout(r, 600));
+                result = await aisBridgeSwitch(targetVoiceId);
+                if (result.success) break;
+            }
+        }
+
+        if (result.success) {
+            // Avatar Shots needs an explicit Save changes to apply the selection
+            if (isAvatarShots) {
+                await new Promise(r => setTimeout(r, 200));
+                const saveBtn = [...document.querySelectorAll('[role="dialog"] button')]
+                    .find(b => b.textContent.trim() === 'Save changes');
+                if (saveBtn) saveBtn.click();
+            }
+            setStatus(`✅ 已切换到「${result.name}」`, 'success');
+            showToast(`✅ 已切换到「${result.name}」`, 'success', 2500);
+        } else {
+            setStatus('未找到该声音（已搜索全部标签）', 'error');
+        }
+    }
+
+    function aisSearchVoices(q) {
+        const query = (q || '').trim().toLowerCase();
+        const seen = new Set();
+        const results = [];
+
+        // My Voices first, then db (library)
+        const all = [
+            ...mvVoices.map(v => ({ ...v, _src: 'my' })),
+            ...Object.values(db.voices).map(v => ({ ...v, _src: 'lib' })),
+        ];
+
+        if (!query) {
+            for (const v of all) {
+                if (!v.voice_id || seen.has(v.voice_id)) continue;
+                seen.add(v.voice_id);
+                results.push(v);
+                if (results.length >= 50) break;
+            }
+        } else {
+            // Exact / prefix voice_id match first
+            for (const v of all) {
+                if (!v.voice_id || seen.has(v.voice_id)) continue;
+                const id = v.voice_id.toLowerCase();
+                if (id === query || id.startsWith(query)) { seen.add(v.voice_id); results.push(v); }
+            }
+            // Partial name / id match
+            for (const v of all) {
+                if (!v.voice_id || seen.has(v.voice_id)) continue;
+                if ((v.display_name || '').toLowerCase().includes(query) ||
+                    (v.voice_id || '').toLowerCase().includes(query)) {
+                    seen.add(v.voice_id);
+                    results.push(v);
+                    if (results.length >= 80) break;
+                }
+            }
+        }
+
+        aisSearchResults = results;
+        aisRenderResults();
+    }
+
+    function aisRenderResults() {
+        const listEl = document.getElementById('hvt-ais-list');
+        if (!listEl) return;
+        if (aisSearchResults.length === 0) {
+            listEl.innerHTML = '<div class="hvt-ais-empty">无匹配结果，可先「获取/更新人声」或「我的声音」加载数据</div>';
+            return;
+        }
+        listEl.innerHTML = '';
+        const frag = document.createDocumentFragment();
+        aisSearchResults.forEach(v => {
+            const id = v.voice_id || '';
+            const name = v.display_name || id;
+            const gender = (v.gender || '').toLowerCase();
+            const genderIcon = gender === 'female' ? '♀' : gender === 'male' ? '♂' : '';
+            const isMyVoice = v._src === 'my';
+            const row = document.createElement('div');
+            row.className = 'hvt-ais-row';
+            row.title = `Voice ID: ${id}\n点击切换`;
+            row.innerHTML = `
+                <span class="hvt-ais-src" title="${isMyVoice ? '我的声音' : '声音库'}">${isMyVoice ? '🎤' : '📚'}</span>
+                <span class="hvt-ais-name">${esc(name)}</span>
+                ${genderIcon ? `<span class="hvt-ais-gender ${gender === 'female' ? 'hvt-f' : 'hvt-m'}">${genderIcon}</span>` : ''}
+                <span class="hvt-ais-id">${esc(id.slice(0, 8))}…</span>
+            `;
+            row.addEventListener('click', () => aisQuickSwitch(id));
+            frag.appendChild(row);
+        });
+        listEl.appendChild(frag);
+    }
+
+    function openAisPanel() {
+        const overlay = document.getElementById('hvt-ais-overlay');
+        if (overlay) overlay.style.display = 'flex';
+        // Ensure mvVoices is populated (from cache immediately, then refresh in background if stale)
+        mvEnsureCache();
+        const searchEl = document.getElementById('hvt-ais-search');
+        if (searchEl) { searchEl.value = ''; searchEl.focus(); }
+        aisSearchVoices('');
+        const statusEl = document.getElementById('hvt-ais-status');
+        if (statusEl) {
+            const onSupportedPage = location.pathname.includes('/create-v4/') || location.pathname.includes('/avatar/');
+            statusEl.textContent = onSupportedPage ? '' : '⚠️ 请在 AI Studio 或 Avatar Shots 页面使用';
+            statusEl.dataset.type = onSupportedPage ? '' : 'warn';
+        }
+    }
+
+    function closeAisPanel() {
+        const overlay = document.getElementById('hvt-ais-overlay');
+        if (overlay) overlay.style.display = 'none';
+    }
+
     // ─── Build UI ─────────────────────────────────────────────────────────────
     function buildUI() {
         const fabStrip = document.createElement('div');
@@ -1871,6 +2134,13 @@
                     <path d="M3 18v-6a9 9 0 0 1 18 0v6"/>
                     <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z"/>
                     <path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
+                </svg>
+            </button>
+            <div class="hvt-fab-divider"></div>
+            <button id="hvt-fab-ais" title="AI Studio 快速换声音">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M7 16V4m0 0L3 8m4-4l4 4"/>
+                    <path d="M17 8v12m0 0l4-4m-4 4l-4-4"/>
                 </svg>
             </button>
             <div class="hvt-fab-divider"></div>
@@ -1974,6 +2244,26 @@
 <input type="file" id="hvt-file-input" accept=".json" style="display:none">
         `;
         document.body.appendChild(root);
+
+        // AI Studio Quick Voice Switch overlay
+        const aisRoot = document.createElement('div');
+        aisRoot.id = 'hvt-ais-overlay';
+        aisRoot.style.display = 'none';
+        aisRoot.innerHTML = `
+            <div id="hvt-ais-panel">
+              <div id="hvt-ais-header">
+                <span id="hvt-ais-title">⇄ AI Studio 换声音</span>
+                <button id="hvt-ais-close" title="关闭">✕</button>
+              </div>
+              <div id="hvt-ais-search-row">
+                <input id="hvt-ais-search" class="hvt-input" placeholder="搜索名称 / 粘贴 Voice ID…" autocomplete="off">
+              </div>
+              <div id="hvt-ais-status"></div>
+              <div id="hvt-ais-list"></div>
+              <div id="hvt-ais-footer">点击声音行即可切换 · 🎤 我的声音 &nbsp;📚 声音库</div>
+            </div>
+        `;
+        document.body.appendChild(aisRoot);
 
         // Voice Design modal — independent top-level element
         const vdRoot = document.createElement('div');
@@ -2165,6 +2455,10 @@
                 const wrap = document.getElementById('hvt-table-wrap');
                 if (wrap) wrap.scrollLeft = 0;
             }
+        });
+
+        document.getElementById('hvt-fab-ais').addEventListener('click', () => {
+            openAisPanel();
         });
 
         document.getElementById('hvt-fab-vd').addEventListener('click', () => {
@@ -2409,6 +2703,27 @@
                 showToast('导入失败: ' + err.message, 'error', 4000);
             }
             e.target.value = '';
+        });
+
+        // AI Studio Quick Switch panel
+        document.getElementById('hvt-ais-close').addEventListener('click', closeAisPanel);
+        document.getElementById('hvt-ais-overlay').addEventListener('click', (e) => {
+            if (e.target === document.getElementById('hvt-ais-overlay')) closeAisPanel();
+        });
+        document.getElementById('hvt-ais-search').addEventListener('input', debounce((e) => {
+            aisSearchVoices(e.target.value);
+        }, 200));
+        document.getElementById('hvt-ais-search').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                const q = e.target.value.trim();
+                // If it's a bare voice_id (32-char hex or any single token with no spaces), switch directly
+                if (/^[0-9a-zA-Z_-]{8,}$/.test(q) && !q.includes(' ')) {
+                    aisQuickSwitch(q);
+                } else if (aisSearchResults.length === 1) {
+                    aisQuickSwitch(aisSearchResults[0].voice_id);
+                }
+            }
+            if (e.key === 'Escape') closeAisPanel();
         });
 
         // Voice Design modal

@@ -24,6 +24,7 @@ jobs:
             content.js \
             content.css \
             background.js \
+            ais-bridge.js \
             icon.png \
             proc11ShareVoice.js \
             README.md

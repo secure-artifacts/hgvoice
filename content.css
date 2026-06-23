@@ -20,7 +20,7 @@
 }
 #hvt-fab-strip:hover { box-shadow: 0 6px 24px rgba(37,99,235,0.55); }
 
-#hvt-fab, #hvt-fab-vd {
+#hvt-fab, #hvt-fab-vd, #hvt-fab-ais {
     width: 38px;
     height: 38px;
     border-radius: 50%;
@@ -34,12 +34,12 @@
     padding: 0;
     transition: background 0.15s, color 0.15s, transform 0.12s;
 }
-#hvt-fab:hover, #hvt-fab-vd:hover {
+#hvt-fab:hover, #hvt-fab-vd:hover, #hvt-fab-ais:hover {
     background: rgba(255,255,255,0.18);
     color: #fff;
     transform: scale(1.1);
 }
-#hvt-fab svg, #hvt-fab-vd svg { width: 20px; height: 20px; }
+#hvt-fab svg, #hvt-fab-vd svg, #hvt-fab-ais svg { width: 20px; height: 20px; }
 
 .hvt-fab-divider {
     width: 1px;
@@ -1287,5 +1287,128 @@ td.hvt-copied { animation: hvt-copy-flash 0.55s ease-out; }
     padding: 40px 20px;
     color: #94a3b8;
     font-size: 14px;
+}
+
+/* ─── AI Studio Quick Voice Switch overlay ─────────────────────────────── */
+#hvt-ais-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 2147483645;
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-end;
+    padding: 0 132px 72px 0; /* align above the FAB strip */
+    pointer-events: none;
+}
+#hvt-ais-panel {
+    width: 340px;
+    max-height: 520px;
+    background: #ffffff;
+    border: 1px solid #93c5fd;
+    border-radius: 14px;
+    box-shadow: 0 12px 40px rgba(37,99,235,0.18), 0 2px 10px rgba(0,0,0,0.10);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    pointer-events: all;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+    font-size: 14px;
+    color: #1e293b;
+    animation: hvt-ais-slide-in 0.18s ease-out;
+}
+@keyframes hvt-ais-slide-in {
+    from { opacity: 0; transform: translateY(12px) scale(0.97); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+#hvt-ais-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: #eff6ff;
+    border-bottom: 1px solid #93c5fd;
+    flex-shrink: 0;
+}
+#hvt-ais-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: #1d4ed8;
+}
+#hvt-ais-close {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: #64748b;
+    font-size: 16px;
+    line-height: 1;
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+#hvt-ais-close:hover { background: #e2e8f0; color: #1e293b; }
+#hvt-ais-search-row {
+    padding: 8px 12px;
+    border-bottom: 1px solid #e2e8f0;
+    flex-shrink: 0;
+}
+#hvt-ais-search {
+    width: 100%;
+    box-sizing: border-box;
+}
+#hvt-ais-status {
+    padding: 4px 12px 2px;
+    font-size: 12px;
+    color: #64748b;
+    flex-shrink: 0;
+    min-height: 20px;
+}
+#hvt-ais-status[data-type="error"] { color: #dc2626; }
+#hvt-ais-status[data-type="success"] { color: #059669; }
+#hvt-ais-status[data-type="warn"] { color: #b45309; }
+#hvt-ais-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 0;
+}
+.hvt-ais-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 12px;
+    cursor: pointer;
+    transition: background 0.12s;
+    border-bottom: 1px solid #f1f5f9;
+}
+.hvt-ais-row:last-child { border-bottom: none; }
+.hvt-ais-row:hover { background: #eff6ff; }
+.hvt-ais-src { font-size: 13px; flex-shrink: 0; }
+.hvt-ais-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+    font-weight: 500;
+}
+.hvt-ais-gender { font-size: 12px; flex-shrink: 0; }
+.hvt-ais-id {
+    font-size: 11px;
+    color: #94a3b8;
+    font-family: monospace;
+    flex-shrink: 0;
+}
+.hvt-ais-empty {
+    padding: 24px 16px;
+    color: #94a3b8;
+    font-size: 13px;
+    text-align: center;
+    line-height: 1.5;
+}
+#hvt-ais-footer {
+    padding: 6px 12px;
+    font-size: 11px;
+    color: #94a3b8;
+    background: #f8fafc;
+    border-top: 1px solid #e2e8f0;
+    flex-shrink: 0;
 }
 
