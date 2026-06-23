@@ -1890,6 +1890,7 @@
 
     // ─── AI Studio Quick Voice Switch ────────────────────────────────────────
     let aisSearchResults = [];
+    let aisFallbackToken = 0; // incremented to cancel an in-flight fallback search
 
     // aisIsModalOpen: detects both AI Studio "Select Voice" and Avatar Shots "Choose avatar voice"
     function aisIsModalOpen() {
@@ -2033,6 +2034,7 @@
     }
 
     function aisSearchVoices(q) {
+        const myToken = ++aisFallbackToken; // cancel any running fallback
         const query = (q || '').trim().toLowerCase();
         const seen = new Set();
         const results = [];
@@ -2071,6 +2073,46 @@
 
         aisSearchResults = results;
         aisRenderResults();
+        // If nothing found in cache, fetch live page-by-page until a match is found
+        if (results.length === 0 && query) aisFallbackSearch(query, myToken);
+    }
+
+    async function aisFallbackSearch(query, myToken) {
+        const listEl = document.getElementById('hvt-ais-list');
+        if (listEl) listEl.innerHTML = '<div class="hvt-ais-empty">正在实时搜索…</div>';
+        let token = null;
+        for (let page = 0; page < 20; page++) {
+            if (aisFallbackToken !== myToken) return;
+            let url = '/v2/pacific/voice_clone/voice.list?page_size=50';
+            if (token) url += '&next_token=' + encodeURIComponent(token);
+            let data;
+            try {
+                data = await heygenApi(url);
+            } catch (e) {
+                if (aisFallbackToken !== myToken) return;
+                if (listEl) listEl.innerHTML = `<div class="hvt-ais-empty" style="color:#dc2626">实时搜索出错: ${esc(e.message)}</div>`;
+                return;
+            }
+            if (aisFallbackToken !== myToken) return;
+            const list = data.data || data.list || data.voices || [];
+            const matched = list.filter(v =>
+                (v.voice_id || '').toLowerCase().includes(query) ||
+                (v.display_name || '').toLowerCase().includes(query)
+            );
+            if (matched.length > 0) {
+                const existingIds = new Set(mvVoices.map(v => v.voice_id));
+                for (const v of matched) {
+                    if (!existingIds.has(v.voice_id)) mvVoices.push(v);
+                }
+                const searchEl = document.getElementById('hvt-ais-search');
+                aisSearchVoices(searchEl ? searchEl.value : query);
+                return;
+            }
+            token = data.next_pagination_token || null;
+            if (!token) break;
+        }
+        if (aisFallbackToken !== myToken) return;
+        if (listEl) listEl.innerHTML = `<div class="hvt-ais-empty" style="color:#dc2626">实时搜索完毕，未找到「${esc(query)}」</div>`;
     }
 
     function aisRenderResults() {
