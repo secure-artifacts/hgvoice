@@ -7,6 +7,13 @@
     const STORE_KEY = 'hvt_data_v1';
     const MV_CACHE_KEY = 'hvt_mv_cache_v1';
     const MV_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
+    // 分享到期清理（Share Expiry Cleanup）
+    const EXP_LEDGER_KEY = 'hvt_share_ledger_v1'; // { "voiceId::email": 首次发现时间戳 }
+    const EXP_DAYS_KEY = 'hvt_share_expiry_days';  // 用户配置的过期天数
+    const EXP_WL_KEY = 'hvt_share_whitelist_v1';   // 白名单邮箱数组（永不列出/撤销）
+    const EXP_DAYS_DEFAULT = 60;
+    const EXP_AUTO_KEY = 'hvt_share_auto_clean';   // '1'/'0'：是否自动清理超期分享
+    const EXP_AUTO_LAST_KEY = 'hvt_share_auto_last'; // 上次自动清理时间戳（节流用）
     const API_BASE = 'https://api2.heygen.com';
 
     // ── 语言 / 地区设置（按需修改，供不同地区用户使用）──────────────────────
@@ -195,10 +202,16 @@
     let mvPlayingId = null; // currently playing voice id in my-voices panel
     let mvVoices = []; // cached my-voices list
     let mvSelectedIds = new Set(); // checked voices for batch download
+    let mvDelRunning = false;      // batch-delete in progress
+    let mvDelAbort = false;        // set by 停止 to break the delete loop
     let mvShareVoice = null; // voice currently targeted by the share dialog
     let mvShareDone = []; // emails successfully shared in the current share-dialog session
     let mvShareAbort = false; // set by 停止 to break the batch-remove loop
     let mvShareWaitCancel = null; // cancels the in-progress inter-delete delay
+    let expAbort = false;       // set by 停止 to break the expiry-cleanup loop
+    let expRows = [];           // current scan result rows
+    let expMyUsername = null;   // cached current-user username for owner check
+    let expAutoRunning = false; // guards against concurrent auto-clean runs
     let mainSelectedIds = new Set(); // checked voices in main table for download
 
     // ─── Storage ──────────────────────────────────────────────────────────────
@@ -1531,6 +1544,214 @@
         }
     }
 
+    // ─── Share Expiry Cleanup（分享到期清理） ───────────────────────────────
+    // HeyGen 不返回分享创建时间，所以用本地台账记录每个 (voiceId::email) 的首次
+    // 发现时间，以此判断分享存在了多久。撤销复用 share_resources/remove 接口。
+    function expReadLedger() {
+        try { return JSON.parse(localStorage.getItem(EXP_LEDGER_KEY)) || {}; } catch { return {}; }
+    }
+    function expWriteLedger(l) {
+        try { localStorage.setItem(EXP_LEDGER_KEY, JSON.stringify(l)); } catch {}
+    }
+    function expGetDays() {
+        const n = parseInt(localStorage.getItem(EXP_DAYS_KEY), 10);
+        return Number.isFinite(n) && n > 0 ? n : EXP_DAYS_DEFAULT;
+    }
+    function expSetDays(n) {
+        if (Number.isFinite(n) && n > 0) localStorage.setItem(EXP_DAYS_KEY, String(n));
+    }
+    function expReadWhitelist() {
+        try { return JSON.parse(localStorage.getItem(EXP_WL_KEY)) || []; } catch { return []; }
+    }
+    function expWriteWhitelist(arr) {
+        const clean = [...new Set(arr.map(e => (e || '').trim().toLowerCase()).filter(Boolean))];
+        try { localStorage.setItem(EXP_WL_KEY, JSON.stringify(clean)); } catch {}
+    }
+
+    async function expGetMyUsername() {
+        if (expMyUsername) return expMyUsername;
+        try { const d = await heygenApi('/v1/user.get'); expMyUsername = d?.username || null; } catch { expMyUsername = null; }
+        return expMyUsername;
+    }
+
+    // Scan own voices, refresh the ledger (record new shares, drop vanished
+    // ones), and return non-whitelisted rows sorted oldest-first.
+    async function expScan() {
+        const me = await expGetMyUsername();
+        const voices = await mvFetchAllVoices();
+        const ledger = expReadLedger();
+        const wl = new Set(expReadWhitelist());
+        const now = Date.now();
+        const seen = new Set();
+        const rows = [];
+        for (const v of voices) {
+            if (me && v.creator_username !== me) continue; // 只能撤销自己创建的声音
+            for (const email of Object.keys(v.spaces_or_users_shared_to || {})) {
+                const key = v.voice_id + '::' + email;
+                seen.add(key);
+                if (!ledger[key]) ledger[key] = now;
+                if (wl.has(email.toLowerCase())) continue;
+                const days = Math.floor((now - ledger[key]) / 86400000);
+                rows.push({ voiceId: v.voice_id, voiceName: v.display_name || v.voice_id, email, days });
+            }
+        }
+        for (const key of Object.keys(ledger)) if (!seen.has(key)) delete ledger[key];
+        expWriteLedger(ledger);
+        rows.sort((a, b) => b.days - a.days);
+        expRows = rows;
+        return rows;
+    }
+
+    // Batch un-share selected (voiceId,email) pairs. Same 4–8s randomized delay
+    // + stop support as the manual share-remove flow.
+    async function expRemoveSelected(items) {
+        if (!items.length) return;
+        const status = document.getElementById('hvt-exp-status');
+        const delBtn = document.getElementById('hvt-exp-remove');
+        const stopBtn = document.getElementById('hvt-exp-stop');
+        expAbort = false;
+        if (delBtn) delBtn.disabled = true;
+        if (stopBtn) stopBtn.style.display = 'inline-flex';
+
+        const ledger = expReadLedger();
+        let removed = 0, failed = 0;
+        for (let i = 0; i < items.length; i++) {
+            if (expAbort) break;
+            if (status) status.textContent = `撤销中 ${i + 1}/${items.length}…`;
+            try {
+                await heygenApi('/v1/share_resources/remove', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        resource_type: 'VOICE',
+                        resource_id: items[i].voiceId,
+                        destination_email_address: items[i].email,
+                    }),
+                });
+                delete ledger[items[i].voiceId + '::' + items[i].email];
+                expWriteLedger(ledger);
+                removed++;
+            } catch (e) { failed++; }
+            if (i < items.length - 1 && !expAbort) await mvShareSleep(4000 + Math.random() * 4000);
+        }
+        if (stopBtn) stopBtn.style.display = 'none';
+        if (delBtn) delBtn.disabled = false;
+        const tail = expAbort ? '（已停止）' : '';
+        if (status) status.textContent = (failed > 0 ? `已撤销 ${removed} 个，${failed} 个失败` : `已撤销 ${removed} 个`) + tail;
+        await expRefresh();
+    }
+
+    function openExpPanel() {
+        const overlay = document.getElementById('hvt-exp-overlay');
+        if (!overlay) return;
+        overlay.style.display = 'flex';
+        const daysEl = document.getElementById('hvt-exp-days');
+        if (daysEl) daysEl.value = expGetDays();
+        const autoEl = document.getElementById('hvt-exp-auto');
+        if (autoEl) autoEl.checked = expGetAuto();
+        expRenderWhitelist();
+        expRefresh();
+    }
+    function closeExpPanel() {
+        const overlay = document.getElementById('hvt-exp-overlay');
+        if (overlay) overlay.style.display = 'none';
+    }
+
+    async function expRefresh() {
+        const listEl = document.getElementById('hvt-exp-list');
+        const status = document.getElementById('hvt-exp-status');
+        if (listEl) listEl.innerHTML = '<div class="hvt-mv-empty">扫描中…</div>';
+        try {
+            await expScan();
+            expRender();
+            if (status) status.textContent = '';
+        } catch (e) {
+            if (listEl) listEl.innerHTML = `<div class="hvt-mv-empty" style="color:#dc2626">扫描失败: ${esc(e.message)}</div>`;
+        }
+    }
+
+    function expRender() {
+        const listEl = document.getElementById('hvt-exp-list');
+        const countEl = document.getElementById('hvt-exp-count');
+        if (!listEl) return;
+        const days = expGetDays();
+        const expiredCount = expRows.filter(r => r.days >= days).length;
+        if (countEl) countEl.textContent = `共 ${expRows.length} 个分享 · ${expiredCount} 个已超 ${days} 天`;
+        if (!expRows.length) {
+            listEl.innerHTML = '<div class="hvt-mv-empty">没有检测到你分享出去的声音</div>';
+            return;
+        }
+        listEl.innerHTML = '';
+        const frag = document.createDocumentFragment();
+        expRows.forEach((r, idx) => {
+            const expired = r.days >= days;
+            const row = document.createElement('div');
+            row.className = 'hvt-exp-row' + (expired ? ' hvt-exp-expired' : '');
+            row.innerHTML = `
+                <input type="checkbox" class="hvt-exp-cb" data-idx="${idx}" ${expired ? 'checked' : ''}>
+                <span class="hvt-exp-voice" title="${esc(r.voiceName)}">${esc(r.voiceName)}</span>
+                <span class="hvt-exp-email" title="${esc(r.email)}">${esc(r.email)}</span>
+                <span class="hvt-exp-days">${r.days} 天</span>
+                <button class="hvt-exp-wl-add" data-email="${esc(r.email)}" title="加入白名单（永不列出）">☆</button>
+            `;
+            frag.appendChild(row);
+        });
+        listEl.appendChild(frag);
+        const expBtn = document.getElementById('hvt-exp-remove-expired');
+        if (expBtn) {
+            expBtn.textContent = expiredCount ? `撤销全部超期（${expiredCount}）` : '撤销全部超期';
+            expBtn.disabled = expiredCount === 0;
+        }
+        const selAll = document.getElementById('hvt-exp-selall');
+        if (selAll) selAll.checked = expiredCount > 0;
+    }
+
+    function expRenderWhitelist() {
+        const wlListEl = document.getElementById('hvt-exp-wl-list');
+        if (!wlListEl) return;
+        const wl = expReadWhitelist();
+        if (!wl.length) { wlListEl.innerHTML = '<span class="hvt-exp-wl-empty">（白名单为空）</span>'; return; }
+        wlListEl.innerHTML = '';
+        wl.forEach(email => {
+            const chip = document.createElement('span');
+            chip.className = 'hvt-exp-wl-chip';
+            chip.innerHTML = `<span>${esc(email)}</span><button class="hvt-exp-wl-del" data-email="${esc(email)}" title="移出白名单">✕</button>`;
+            wlListEl.appendChild(chip);
+        });
+    }
+
+    function expWhitelistAdd(emails) {
+        if (!emails || !emails.length) return;
+        expWriteWhitelist([...expReadWhitelist(), ...emails]);
+        expRenderWhitelist();
+        expRefresh();
+    }
+    function expWhitelistRemove(email) {
+        expWriteWhitelist(expReadWhitelist().filter(e => e !== (email || '').toLowerCase()));
+        expRenderWhitelist();
+        expRefresh();
+    }
+
+    function expGetAuto() { return localStorage.getItem(EXP_AUTO_KEY) === '1'; }
+    function expSetAuto(on) { localStorage.setItem(EXP_AUTO_KEY, on ? '1' : '0'); }
+
+    // Auto-clean (opt-in): on each HeyGen load, silently revoke shares that have
+    // exceeded the configured age. Throttled to once per 30 min and guarded
+    // against concurrent runs (multiple tabs).
+    async function expAutoCleanRun() {
+        if (!expGetAuto() || expAutoRunning) return;
+        const last = parseInt(localStorage.getItem(EXP_AUTO_LAST_KEY), 10) || 0;
+        if (Date.now() - last < 30 * 60 * 1000) return; // 30 分钟节流
+        expAutoRunning = true;
+        localStorage.setItem(EXP_AUTO_LAST_KEY, String(Date.now()));
+        try {
+            await expScan();
+            const days = expGetDays();
+            const items = expRows.filter(r => r.days >= days).map(r => ({ voiceId: r.voiceId, email: r.email }));
+            if (items.length) await expRemoveSelected(items);
+        } catch {}
+        expAutoRunning = false;
+    }
+
     function mvStopAudio() {
         if (mvAudioEl) { try { mvAudioEl.pause(); } catch (e) { } mvAudioEl = null; }
         if (mvPlayingId) {
@@ -1695,6 +1916,45 @@
         showToast(failed > 0 ? `完成：${done} 成功，${failed} 失败` : `✅ 已下载 ${done} 个音频`, 'success', 3000);
     }
 
+    // Batch-delete selected voices — only ones the current user created.
+    // Endpoint: POST /v1/pacific/voice.delete  body {voice_id}
+    async function mvDeleteSelected() {
+        if (mvDelRunning) return;
+        const ids = [...mvSelectedIds];
+        if (!ids.length) return;
+        const me = await expGetMyUsername();
+        const targets = mvVoices.filter(v => ids.includes(v.voice_id || ''));
+        const mine = targets.filter(v => !me || v.creator_username === me);
+        const notMine = targets.length - mine.length;
+        if (!mine.length) { showToast('选中的声音都不是你创建的，无法删除', 'error', 3500); return; }
+
+        let msg = `确定永久删除 ${mine.length} 个你创建的声音？此操作不可逆！\n\n`
+            + mine.slice(0, 12).map(v => '· ' + (v.display_name || v.voice_id)).join('\n')
+            + (mine.length > 12 ? `\n…等共 ${mine.length} 个` : '');
+        if (notMine) msg += `\n\n（选中的另有 ${notMine} 个是他人分享给你的，会自动跳过）`;
+        if (!confirm(msg)) return;
+
+        const delBtn = document.getElementById('hvt-mv-del-sel');
+        mvDelRunning = true; mvDelAbort = false;
+        let removed = 0, failed = 0;
+        for (let i = 0; i < mine.length; i++) {
+            if (mvDelAbort) break;
+            if (delBtn) delBtn.textContent = `■ 停止 (${i + 1}/${mine.length})`;
+            try {
+                await heygenApi('/v1/pacific/voice.delete', { method: 'POST', body: JSON.stringify({ voice_id: mine[i].voice_id }) });
+                mvSelectedIds.delete(mine[i].voice_id);
+                mvVoices = mvVoices.filter(x => x.voice_id !== mine[i].voice_id);
+                removed++;
+            } catch (e) { failed++; }
+            if (i < mine.length - 1 && !mvDelAbort) await mvShareSleep(1500 + Math.random() * 1500);
+        }
+        try { localStorage.setItem(MV_CACHE_KEY, JSON.stringify({ ts: Date.now(), voices: mvVoices })); } catch {}
+        mvDelRunning = false;
+        mvRenderList();
+        const tail = mvDelAbort ? '（已停止）' : '';
+        showToast(failed ? `已删除 ${removed} 个，${failed} 个失败${tail}` : `✅ 已删除 ${removed} 个声音${tail}`, failed ? 'error' : 'success', 3500);
+    }
+
     function mvUpdateSelectionUI() {
         const dlSelBtn = document.getElementById('hvt-mv-dl-sel');
         const selCountEl = document.getElementById('hvt-mv-sel-count');
@@ -1702,6 +1962,11 @@
         const n = mvSelectedIds.size;
         dlSelBtn.style.display = n > 0 ? 'inline-flex' : 'none';
         dlSelBtn.textContent = `⬇ 下载已选 (${n})`;
+        const delSelBtn = document.getElementById('hvt-mv-del-sel');
+        if (delSelBtn) {
+            delSelBtn.style.display = n > 0 ? 'inline-flex' : 'none';
+            if (!mvDelRunning) delSelBtn.textContent = `🗑 删除选中 (${n})`;
+        }
         if (selCountEl) selCountEl.textContent = n > 0 ? `已选 ${n} 个` : '';
     }
 
@@ -1861,30 +2126,42 @@
         }
     }
 
-    // Silently populate mvVoices from API without needing My Voices panel DOM.
-    // Called in background when AIS panel opens so voiceObj is available for capturedOnSelect fallback.
+    // Fetch every page of the voice clone list. Returns the full voice array.
+    async function mvFetchAllVoices() {
+        let allVoices = [], seenIds = new Set(), nextToken = null;
+        for (let page = 0; page < 20; page++) {
+            let url = `/v2/pacific/voice_clone/voice.list?page_size=50`;
+            if (nextToken) url += `&next_token=${encodeURIComponent(nextToken)}`;
+            const data = await heygenApi(url);
+            const list = data.data || data.list || data.voices || [];
+            const fresh = list.filter(v => v.voice_id && !seenIds.has(v.voice_id));
+            if (fresh.length === 0) break;
+            fresh.forEach(v => seenIds.add(v.voice_id));
+            allVoices = allVoices.concat(fresh);
+            nextToken = data.next_pagination_token || null;
+            if (!nextToken) break;
+        }
+        return allVoices;
+    }
+
+    // Populate mvVoices for the AIS panel. Cache-first for an instant open, then
+    // ALWAYS revalidate in the background: voices shared by other accounts only
+    // live in voice_clone/voice.list and are absent from an older cached snapshot,
+    // so we must not wait for the 24h TTL to expire before they become searchable.
     async function mvEnsureCache() {
         const c = mvReadCache();
-        if (c && Date.now() - c.ts < MV_CACHE_TTL) {
-            if (mvVoices.length === 0) mvVoices = c.voices;
-            return;
-        }
+        if (c && mvVoices.length === 0) mvVoices = c.voices;
         try {
-            let allVoices = [], seenIds = new Set(), nextToken = null;
-            for (let page = 0; page < 20; page++) {
-                let url = `/v2/pacific/voice_clone/voice.list?page_size=50`;
-                if (nextToken) url += `&next_token=${encodeURIComponent(nextToken)}`;
-                const data = await heygenApi(url);
-                const list = data.data || data.list || data.voices || [];
-                const fresh = list.filter(v => v.voice_id && !seenIds.has(v.voice_id));
-                if (fresh.length === 0) break;
-                fresh.forEach(v => seenIds.add(v.voice_id));
-                allVoices = allVoices.concat(fresh);
-                nextToken = data.next_pagination_token || null;
-                if (!nextToken) break;
-            }
+            const allVoices = await mvFetchAllVoices();
             mvVoices = allVoices;
             try { localStorage.setItem(MV_CACHE_KEY, JSON.stringify({ ts: Date.now(), voices: allVoices })); } catch {}
+            // Panel still open → re-run the current search so freshly fetched
+            // shared voices surface without the user touching the input again.
+            const overlay = document.getElementById('hvt-ais-overlay');
+            if (overlay && overlay.style.display !== 'none') {
+                const searchEl = document.getElementById('hvt-ais-search');
+                aisSearchVoices(searchEl ? searchEl.value : '');
+            }
         } catch {}
     }
 
@@ -2073,13 +2350,24 @@
 
         aisSearchResults = results;
         aisRenderResults();
-        // If nothing found in cache, fetch live page-by-page until a match is found
-        if (results.length === 0 && query) aisFallbackSearch(query, myToken);
+        // Fall back to a live page-by-page fetch when the local cache can't
+        // satisfy the query: nothing matched, or the query is a full voice_id
+        // not loaded yet (covers shared voices absent from a stale cache while
+        // the background revalidation in mvEnsureCache is still in flight).
+        const looksLikeId = /^[a-z0-9]{32}$/.test(query) || /^[a-z0-9]{20}$/.test(query);
+        const hasExactId = results.some(v => (v.voice_id || '').toLowerCase() === query);
+        if (query && (results.length === 0 || (looksLikeId && !hasExactId))) {
+            aisFallbackSearch(query, myToken);
+        }
     }
 
     async function aisFallbackSearch(query, myToken) {
         const listEl = document.getElementById('hvt-ais-list');
-        if (listEl) listEl.innerHTML = '<div class="hvt-ais-empty">正在实时搜索…</div>';
+        // Only replace the list with a loading hint when there are no local
+        // results worth keeping on screen; otherwise revalidate silently.
+        if (listEl && aisSearchResults.length === 0) {
+            listEl.innerHTML = '<div class="hvt-ais-empty">正在实时搜索…</div>';
+        }
         let token = null;
         for (let page = 0; page < 20; page++) {
             if (aisFallbackToken !== myToken) return;
@@ -2090,7 +2378,7 @@
                 data = await heygenApi(url);
             } catch (e) {
                 if (aisFallbackToken !== myToken) return;
-                if (listEl) listEl.innerHTML = `<div class="hvt-ais-empty" style="color:#dc2626">实时搜索出错: ${esc(e.message)}</div>`;
+                if (listEl && aisSearchResults.length === 0) listEl.innerHTML = `<div class="hvt-ais-empty" style="color:#dc2626">实时搜索出错: ${esc(e.message)}</div>`;
                 return;
             }
             if (aisFallbackToken !== myToken) return;
@@ -2112,7 +2400,7 @@
             if (!token) break;
         }
         if (aisFallbackToken !== myToken) return;
-        if (listEl) listEl.innerHTML = `<div class="hvt-ais-empty" style="color:#dc2626">实时搜索完毕，未找到「${esc(query)}」</div>`;
+        if (listEl && aisSearchResults.length === 0) listEl.innerHTML = `<div class="hvt-ais-empty" style="color:#dc2626">实时搜索完毕，未找到「${esc(query)}」</div>`;
     }
 
     function aisRenderResults() {
@@ -2347,8 +2635,10 @@
                 <div style="display:flex;align-items:center;gap:8px">
                   <span id="hvt-mv-count" style="font-size:13px;color:#8b8abf"></span>
                   <span id="hvt-mv-sel-count" style="font-size:13px;color:#a78bfa"></span>
+                  <button id="hvt-mv-exp" class="hvt-btn" title="分享到期清理：撤销超过设定天数的对外分享">⏰ 到期清理</button>
                   <button id="hvt-mv-refresh" class="hvt-btn" title="刷新列表">↺ 刷新</button>
                   <button id="hvt-mv-dl-sel" class="hvt-btn hvt-btn-primary" title="下载已勾选的声音" style="display:none">⬇ 下载已选</button>
+                  <button id="hvt-mv-del-sel" class="hvt-btn hvt-btn-danger" title="删除已勾选、且是你自己创建的声音（不可逆）" style="display:none">🗑 删除选中</button>
                   <button id="hvt-mv-dl-all" class="hvt-btn" title="下载全部声音 MP3">⬇ 全部下载</button>
                   <button id="hvt-mv-close" title="关闭">✕</button>
                 </div>
@@ -2395,6 +2685,47 @@
             </div>
         `;
         document.body.appendChild(shareRoot);
+
+        // Share Expiry Cleanup modal
+        const expRoot = document.createElement('div');
+        expRoot.id = 'hvt-exp-overlay';
+        expRoot.style.display = 'none';
+        expRoot.innerHTML = `
+            <div id="hvt-exp-panel">
+              <div id="hvt-exp-header">
+                <span id="hvt-exp-title">⏰ 分享到期清理</span>
+                <button id="hvt-exp-close" title="关闭">✕</button>
+              </div>
+              <div id="hvt-exp-body">
+                <div id="hvt-exp-config">
+                  <label>超过</label>
+                  <input id="hvt-exp-days" type="number" min="1" class="hvt-input">
+                  <label>天视为过期</label>
+                  <button id="hvt-exp-rescan" class="hvt-btn">↺ 重新扫描</button>
+                  <span id="hvt-exp-count"></span>
+                </div>
+                <label id="hvt-exp-auto-label">
+                  <input type="checkbox" id="hvt-exp-auto">
+                  自动清理超期分享（每次打开 HeyGen 时后台执行，不再逐项询问）
+                </label>
+                <div id="hvt-exp-wl">
+                  <input id="hvt-exp-wl-input" class="hvt-input" placeholder="白名单邮箱（永不列出/撤销）— 回车添加，可粘贴多个">
+                  <div id="hvt-exp-wl-list"></div>
+                </div>
+                <div id="hvt-exp-actions">
+                  <input type="checkbox" id="hvt-exp-selall">
+                  <label for="hvt-exp-selall">全选超期</label>
+                  <button id="hvt-exp-remove" class="hvt-btn">撤销选中</button>
+                  <button id="hvt-exp-remove-expired" class="hvt-btn hvt-btn-danger">撤销全部超期</button>
+                  <button id="hvt-exp-stop" class="hvt-btn" style="display:none">■ 停止</button>
+                  <span id="hvt-exp-status"></span>
+                </div>
+                <div id="hvt-exp-list"></div>
+                <div id="hvt-exp-hint">⚠ 计时从插件首次发现该分享起算——启用前的旧分享按“今天”计；撤销不可逆。</div>
+              </div>
+            </div>
+        `;
+        document.body.appendChild(expRoot);
 
         bindEvents();
         updateSyncInfo();
@@ -2802,6 +3133,10 @@
         document.getElementById('hvt-mv-search').addEventListener('input', mvRenderList);
         document.getElementById('hvt-mv-dl-all').addEventListener('click', mvDownloadSelected);
         document.getElementById('hvt-mv-dl-sel').addEventListener('click', mvDownloadSelected);
+        document.getElementById('hvt-mv-del-sel').addEventListener('click', () => {
+            if (mvDelRunning) { mvDelAbort = true; if (mvShareWaitCancel) mvShareWaitCancel(); }
+            else mvDeleteSelected();
+        });
         document.getElementById('hvt-mv-overlay').addEventListener('click', (e) => {
             if (e.target === document.getElementById('hvt-mv-overlay')) closeMyVoices();
         });
@@ -2827,12 +3162,73 @@
             mvShareAbort = true;
             if (mvShareWaitCancel) mvShareWaitCancel();
         });
+
+        // Share Expiry Cleanup
+        document.getElementById('hvt-mv-exp').addEventListener('click', openExpPanel);
+        document.getElementById('hvt-exp-close').addEventListener('click', closeExpPanel);
+        document.getElementById('hvt-exp-overlay').addEventListener('click', (e) => {
+            if (e.target === document.getElementById('hvt-exp-overlay')) closeExpPanel();
+        });
+        document.getElementById('hvt-exp-rescan').addEventListener('click', expRefresh);
+        document.getElementById('hvt-exp-days').addEventListener('change', (e) => {
+            expSetDays(parseInt(e.target.value, 10));
+            expRender();
+        });
+        document.getElementById('hvt-exp-auto').addEventListener('change', (e) => {
+            if (e.target.checked && !confirm('开启后，每次打开 HeyGen 时会自动撤销超过设定天数的分享，不再逐项询问。撤销不可逆。\n\n确定开启自动清理？')) {
+                e.target.checked = false; return;
+            }
+            expSetAuto(e.target.checked);
+        });
+        document.getElementById('hvt-exp-selall').addEventListener('change', (e) => {
+            const days = expGetDays();
+            document.querySelectorAll('#hvt-exp-list .hvt-exp-cb').forEach(cb => {
+                const r = expRows[parseInt(cb.dataset.idx, 10)];
+                if (r && r.days >= days) cb.checked = e.target.checked; // 只影响超期行
+            });
+        });
+        document.getElementById('hvt-exp-remove').addEventListener('click', () => {
+            const status = document.getElementById('hvt-exp-status');
+            const items = [...document.querySelectorAll('#hvt-exp-list .hvt-exp-cb:checked')]
+                .map(cb => expRows[parseInt(cb.dataset.idx, 10)])
+                .filter(Boolean)
+                .map(r => ({ voiceId: r.voiceId, email: r.email }));
+            if (!items.length) { if (status) status.textContent = '未选择任何分享'; return; }
+            if (!confirm(`确定撤销选中的 ${items.length} 个分享？此操作不可逆。`)) return;
+            expRemoveSelected(items);
+        });
+        document.getElementById('hvt-exp-remove-expired').addEventListener('click', () => {
+            const days = expGetDays();
+            const status = document.getElementById('hvt-exp-status');
+            const items = expRows.filter(r => r.days >= days).map(r => ({ voiceId: r.voiceId, email: r.email }));
+            if (!items.length) { if (status) status.textContent = '没有超期分享'; return; }
+            if (!confirm(`确定撤销全部 ${items.length} 个已超期分享？此操作不可逆。`)) return;
+            expRemoveSelected(items);
+        });
+        document.getElementById('hvt-exp-stop').addEventListener('click', () => {
+            expAbort = true;
+            if (mvShareWaitCancel) mvShareWaitCancel();
+        });
+        document.getElementById('hvt-exp-wl-input').addEventListener('keydown', (e) => {
+            if (e.key !== 'Enter') return;
+            const emails = mvExtractEmails(e.target.value);
+            if (emails.length) { expWhitelistAdd(emails); e.target.value = ''; }
+        });
+        document.getElementById('hvt-exp-wl-list').addEventListener('click', (e) => {
+            const del = e.target.closest('.hvt-exp-wl-del');
+            if (del) expWhitelistRemove(del.dataset.email);
+        });
+        document.getElementById('hvt-exp-list').addEventListener('click', (e) => {
+            const add = e.target.closest('.hvt-exp-wl-add');
+            if (add) expWhitelistAdd([add.dataset.email]);
+        });
     }
 
     // ─── Init ─────────────────────────────────────────────────────────────────
     function init() {
         loadDb();
         buildUI();
+        setTimeout(expAutoCleanRun, 8000); // 若已开启自动清理，加载后在后台执行
     }
 
     if (document.readyState === 'loading') {
