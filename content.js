@@ -7,6 +7,7 @@
     const STORE_KEY = 'hvt_data_v1';
     const MV_CACHE_KEY = 'hvt_mv_cache_v1';
     const MV_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
+    const SPACE_CACHE_KEY = 'hvt_space_voices_cache_v1'; // 社区（Space）声音缓存
     // 分享到期清理（Share Expiry Cleanup）
     const EXP_LEDGER_KEY = 'hvt_share_ledger_v1'; // { "voiceId::email": 首次发现时间戳 }
     const EXP_DAYS_KEY = 'hvt_share_expiry_days';  // 用户配置的过期天数
@@ -45,6 +46,7 @@
     let downloadCancelled = false;
     let activeFilterMode = 'dropdown'; // 'paste' | 'dropdown' — last-applied wins
     let vdAudioEl = null; // audio element for voice design preview
+    let vdAvatarGroupId = null; // cached avatar_group_id used as carrier for photo.prompt
     let selectedTags = new Set(); // multi-select tag chip filter
 
     // ─── Tag / Age translation tables (module-scope so filter logic can use them) ─
@@ -213,6 +215,16 @@
     let expMyUsername = null;   // cached current-user username for owner check
     let expAutoRunning = false; // guards against concurrent auto-clean runs
     let mainSelectedIds = new Set(); // checked voices in main table for download
+    // ─── 社区（Space）声音 ───
+    let spaceVoices = [];            // Space 作用域声音，每条带 _space/_spaceName/_origin
+    let spaceMembers = new Set();    // 所有所属 Space 的成员 username 合集（用于判定 自生成/分享进来）
+    let spacesList = [];             // [{id, name}]
+    let spaceFetchRunning = false;   // 后台拉取进行中
+    let spaceSelectedIds = new Set();// 社区声音视图下勾选的声音
+    let spaceDelRunning = false;     // 社区声音批量删除进行中
+    let spaceDelAbort = false;       // 停止社区删除循环
+    let mvViewMode = 'self';         // 'self'=本号自带声音 | 'space'=社区声音
+    let myUsername = null;           // 当前用户 username（创建者判定）
 
     // ─── Storage ──────────────────────────────────────────────────────────────
     function loadDb() {
@@ -1328,6 +1340,90 @@
         }
     }
 
+    // ─── Voice Design: 头像 → 提示词 ──────────────────────────────────────────
+    // HeyGen 把"分析人脸生成声音提示词"放在 GET /v1/avatar_group/photo.prompt。
+    // 该接口要求一个用户真实拥有的 avatar_group_id（仅作载体，与图片无关），
+    // 且 image_url 须是 HeyGen 能读取的地址；data:URL 会超 GET URL 长度上限，
+    // 故先把图片 PUT 到 temp.create 给的 S3 预签名地址，再用返回的 s3:// 地址调用。
+    async function vdEnsureAvatarGroupId() {
+        if (vdAvatarGroupId) return vdAvatarGroupId;
+        const data = await heygenApi('/v2/avatar_group.private.list?limit=8&page=1&display_type=LIST&look_limit=1');
+        const groups = (data && data.avatar_groups_with_looks) || [];
+        const id = groups.map(g => g.avatar_group && g.avatar_group.id).find(Boolean);
+        if (!id) throw new Error('未找到可用的虚拟形象（avatar group），请先在 HeyGen 创建一个');
+        vdAvatarGroupId = id;
+        return id;
+    }
+
+    // 缩放图片到最长边 ≤ maxSide，输出 JPEG Blob（控制上传体积）
+    function vdResizeImage(file, maxSide = 1024) {
+        return new Promise((resolve, reject) => {
+            const url = URL.createObjectURL(file);
+            const img = new Image();
+            img.onload = () => {
+                URL.revokeObjectURL(url);
+                let { width: w, height: h } = img;
+                const scale = Math.min(1, maxSide / Math.max(w, h));
+                w = Math.round(w * scale); h = Math.round(h * scale);
+                const canvas = document.createElement('canvas');
+                canvas.width = w; canvas.height = h;
+                canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+                canvas.toBlob(b => b ? resolve(b) : reject(new Error('图片处理失败')), 'image/jpeg', 0.9);
+            };
+            img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('无法读取图片')); };
+            img.src = url;
+        });
+    }
+
+    // 上传图片 Blob 到 HeyGen 临时存储，返回可供 photo.prompt 使用的 s3:// 地址
+    async function vdUploadPhoto(blob) {
+        const data = await heygenApi('/v1/avatar_group/photo/temp.create?num_photos=1');
+        const putUrl = data.upload_urls && data.upload_urls[0];
+        const s3Url  = data.s3_urls && data.s3_urls[0];
+        if (!putUrl || !s3Url) throw new Error('获取上传地址失败');
+        const res = await fetch(putUrl, {
+            method: 'PUT',
+            headers: { 'x-amz-server-side-encryption': 'AES256', 'Content-Type': 'image/jpeg' },
+            body: blob,
+        });
+        if (!res.ok) throw new Error(`图片上传失败 HTTP ${res.status}`);
+        return s3Url;
+    }
+
+    async function vdHandlePhotoFile(file) {
+        const statusEl = document.getElementById('hvt-vd-photo-status');
+        const thumbEl  = document.getElementById('hvt-vd-photo-thumb');
+        const phEl     = document.getElementById('hvt-vd-photo-placeholder');
+        const promptEl = document.getElementById('hvt-vd-prompt');
+        if (!file) return;
+
+        // 缩略图预览
+        const previewUrl = URL.createObjectURL(file);
+        thumbEl.src = previewUrl;
+        thumbEl.style.display = 'block';
+        if (phEl) phEl.style.display = 'none';
+
+        statusEl.textContent = '⏳ 分析头像中…';
+        statusEl.className = 'hvt-vd-photo-busy';
+        try {
+            const groupId = await vdEnsureAvatarGroupId();
+            const blob    = await vdResizeImage(file);
+            const s3Url   = await vdUploadPhoto(blob);
+            const path    = `/v1/avatar_group/photo.prompt?avatar_group_id=${encodeURIComponent(groupId)}&image_url=${encodeURIComponent(s3Url)}`;
+            const data    = await heygenApi(path);
+            const prompt  = data && data.prompt;
+            if (!prompt) throw new Error('未返回提示词');
+            promptEl.value = prompt;
+            statusEl.textContent = '✅ 已生成提示词，可编辑后点「生成」';
+            statusEl.className = 'hvt-vd-photo-ok';
+            showToast('✅ 已根据头像生成提示词', 'success', 3000);
+        } catch (e) {
+            statusEl.textContent = '分析失败: ' + e.message;
+            statusEl.className = 'hvt-vd-photo-err';
+            showToast('头像分析失败: ' + e.message, 'error', 4000);
+        }
+    }
+
     function vdRenderSavedList() {
         const el = document.getElementById('hvt-vd-saved-list');
         if (!el) return;
@@ -1368,13 +1464,35 @@
 
     function openMyVoices() {
         const overlay = document.getElementById('hvt-mv-overlay');
-        if (overlay) { overlay.style.display = 'flex'; mvLoadVoices(); }
+        if (overlay) { overlay.style.display = 'flex'; mvSetViewMode('self'); }
     }
 
     function closeMyVoices() {
         const overlay = document.getElementById('hvt-mv-overlay');
         if (overlay) overlay.style.display = 'none';
         mvStopAudio();
+    }
+
+    function mvSetViewMode(mode) {
+        mvViewMode = mode;
+        mvStopAudio();
+        const btn = document.getElementById('hvt-mv-space-toggle');
+        const title = document.getElementById('hvt-mv-title');
+        const expBtn = document.getElementById('hvt-mv-exp');
+        if (mode === 'space') {
+            if (btn) { btn.textContent = '🎤 本号自带'; btn.classList.add('hvt-btn-primary'); }
+            if (title) title.textContent = '🌐 社区声音';
+            if (expBtn) expBtn.style.display = 'none'; // 到期清理只针对本号自带
+            if (!spaceVoices.length && !spaceFetchRunning) spacePrefetch();
+            const searchEl = document.getElementById('hvt-mv-search');
+            if (searchEl) searchEl.value = '';
+            mvRenderList();
+        } else {
+            if (btn) { btn.textContent = '🌐 社区声音'; btn.classList.remove('hvt-btn-primary'); }
+            if (title) title.textContent = '🎤 我的声音';
+            if (expBtn) expBtn.style.display = '';
+            mvLoadVoices();
+        }
     }
 
     // ─── Share Voice (batch email) ──────────────────────────────────────────────
@@ -1848,13 +1966,15 @@
     }
 
     async function mvDownloadSelected() {
-        const pool = mvSelectedIds.size > 0
-            ? mvVoices.filter(v => mvSelectedIds.has(v.voice_id || ''))
-            : [...mvVoices];
+        const sel = mvActiveSel();
+        const voices = mvActiveVoices();
+        const pool = sel.size > 0
+            ? voices.filter(v => sel.has(v.voice_id || ''))
+            : [...voices];
         if (pool.length === 0) { showToast('没有可下载的音频', 'error'); return; }
         const dlSelBtn = document.getElementById('hvt-mv-dl-sel');
         const dlAllBtn = document.getElementById('hvt-mv-dl-all');
-        const activeBtn = mvSelectedIds.size > 0 ? dlSelBtn : dlAllBtn;
+        const activeBtn = sel.size > 0 ? dlSelBtn : dlAllBtn;
         if (activeBtn) activeBtn.disabled = true;
         let done = 0, failed = 0;
         for (const v of pool) {
@@ -1919,6 +2039,7 @@
     // Batch-delete selected voices — only ones the current user created.
     // Endpoint: POST /v1/pacific/voice.delete  body {voice_id}
     async function mvDeleteSelected() {
+        if (mvViewMode === 'space') return spaceDeleteSelected();
         if (mvDelRunning) return;
         const ids = [...mvSelectedIds];
         if (!ids.length) return;
@@ -1959,13 +2080,13 @@
         const dlSelBtn = document.getElementById('hvt-mv-dl-sel');
         const selCountEl = document.getElementById('hvt-mv-sel-count');
         if (!dlSelBtn) return;
-        const n = mvSelectedIds.size;
+        const n = mvActiveSel().size;
         dlSelBtn.style.display = n > 0 ? 'inline-flex' : 'none';
         dlSelBtn.textContent = `⬇ 下载已选 (${n})`;
         const delSelBtn = document.getElementById('hvt-mv-del-sel');
         if (delSelBtn) {
             delSelBtn.style.display = n > 0 ? 'inline-flex' : 'none';
-            if (!mvDelRunning) delSelBtn.textContent = `🗑 删除选中 (${n})`;
+            if (!mvDelRunning && !spaceDelRunning) delSelBtn.textContent = `🗑 删除选中 (${n})`;
         }
         if (selCountEl) selCountEl.textContent = n > 0 ? `已选 ${n} 个` : '';
     }
@@ -1982,7 +2103,12 @@
         }
     }
 
+    // 当前视图对应的数据集与选择集（self=本号自带 / space=社区）
+    function mvActiveVoices() { return mvViewMode === 'space' ? spaceVoices : mvVoices; }
+    function mvActiveSel()    { return mvViewMode === 'space' ? spaceSelectedIds : mvSelectedIds; }
+
     function mvRenderList() {
+        if (mvViewMode === 'space') return spaceRenderList();
         const listEl = document.getElementById('hvt-mv-list');
         if (!listEl) return;
 
@@ -2048,6 +2174,122 @@
             frag.appendChild(row);
         });
         listEl.appendChild(frag);
+    }
+
+    // 社区声音列表渲染：区分「自生成/分享进来」（文字+颜色），支持单选/多选删除。
+    function spaceRenderList() {
+        const listEl = document.getElementById('hvt-mv-list');
+        if (!listEl) return;
+
+        const q = (document.getElementById('hvt-mv-search')?.value || '').toLowerCase().trim();
+        const visible = q
+            ? spaceVoices.filter(v => (v.display_name || '').toLowerCase().includes(q) || (v.voice_id || '').toLowerCase().includes(q))
+            : spaceVoices;
+
+        const selfN = spaceVoices.filter(v => v._origin !== 'shared').length;
+        const sharedN = spaceVoices.length - selfN;
+        const countEl = document.getElementById('hvt-mv-count');
+        if (countEl) {
+            const base = q ? `显示 ${visible.length} / 共 ${spaceVoices.length} 个` : `共 ${spaceVoices.length} 个`;
+            const loading = spaceFetchRunning ? ' · 后台加载中…' : '';
+            countEl.textContent = `${base}（🟢自生成 ${selfN} · 🟠分享 ${sharedN}）${loading}`;
+        }
+
+        if (visible.length === 0) {
+            listEl.innerHTML = `<div class="hvt-mv-empty">${spaceVoices.length === 0 ? (spaceFetchRunning ? '社区声音加载中…' : '没有社区声音') : '无匹配结果'}</div>`;
+            return;
+        }
+        listEl.innerHTML = '';
+        spaceSelectedIds.clear();
+        // 默认只勾选「你自己创建的」（方案甲）
+        visible.forEach(v => { if (myUsername && v.creator_username === myUsername) spaceSelectedIds.add(v.voice_id); });
+        mvUpdateSelectionUI();
+
+        const frag = document.createDocumentFragment();
+        visible.forEach(v => {
+            const id = v.voice_id || '';
+            const name = v.display_name || id;
+            const gender = (v.gender || '').toLowerCase();
+            const genderIcon = gender === 'female' ? '♀' : (gender === 'male' ? '♂' : '');
+            const lang = v.language || '';
+            const eng = mvEngineInfo(v.default_voice_engine);
+            const isShared = v._origin === 'shared';
+            const checked = myUsername && v.creator_username === myUsername;
+
+            const row = document.createElement('div');
+            row.className = 'hvt-mv-row';
+            row.innerHTML = `
+                <input type="checkbox" class="hvt-mv-chk" title="选择删除/下载" ${checked ? 'checked' : ''}>
+                <button class="hvt-mv-play-btn" data-mv-id="${esc(id)}" title="试听（需几秒加载）">
+                    <svg class="ic-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/></svg>
+                    <svg class="ic-stop" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>
+                    <svg class="ic-spin" viewBox="0 0 24 24" style="display:none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2.5" fill="none" stroke-dasharray="28" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/></circle></svg>
+                </button>
+                <span class="hvt-sp-origin ${isShared ? 'hvt-sp-shared' : 'hvt-sp-self'}" title="${isShared ? '由社区外账号分享进来' : '在本社区内创建'}">${isShared ? '分享进来' : '自生成'}</span>
+                <span class="hvt-mv-name" title="${esc(name)}">${esc(name)}</span>
+                ${genderIcon ? `<span class="hvt-mv-gender ${gender === 'female' ? 'hvt-f' : 'hvt-m'}">${genderIcon}</span>` : ''}
+                ${lang ? `<span class="hvt-mv-locale">${esc(lang)}</span>` : ''}
+                ${eng ? `<span class="hvt-mv-engine ${eng.cls}" title="引擎: ${esc(eng.full)}">${esc(eng.short)}</span>` : ''}
+                <span class="hvt-mv-id" title="${esc(id)}">${esc(id.slice(0,8))}…</span>
+                <button class="hvt-mv-copy-btn hvt-btn" data-id="${esc(id)}" title="复制 Voice ID">复制ID</button>
+                <button class="hvt-mv-dl-btn hvt-btn" title="下载 MP3">⬇</button>
+            `;
+            const chk = row.querySelector('.hvt-mv-chk');
+            chk.addEventListener('change', () => {
+                if (chk.checked) spaceSelectedIds.add(id);
+                else spaceSelectedIds.delete(id);
+                mvUpdateSelectionUI();
+            });
+            row.querySelector('.hvt-mv-play-btn').addEventListener('click', () => mvTogglePlay(v));
+            row.querySelector('.hvt-mv-copy-btn').addEventListener('click', e => {
+                navigator.clipboard.writeText(id).then(() => {
+                    const btn = e.currentTarget; const orig = btn.textContent;
+                    btn.textContent = '已复制';
+                    setTimeout(() => { btn.textContent = orig; }, 1200);
+                });
+            });
+            row.querySelector('.hvt-mv-dl-btn').addEventListener('click', () => mvDownloadOne(v));
+            frag.appendChild(row);
+        });
+        listEl.appendChild(frag);
+    }
+
+    // 社区声音批量删除（方案甲）：全部尝试删除，逐个上报成功/失败；
+    // 自己创建的可删，他人/分享进来的若无权限会被后端拒绝并计为失败。
+    async function spaceDeleteSelected() {
+        if (spaceDelRunning) return;
+        const ids = [...spaceSelectedIds];
+        if (!ids.length) return;
+        if (!myUsername) myUsername = await expGetMyUsername();
+        const targets = spaceVoices.filter(v => ids.includes(v.voice_id || ''));
+        const mine = targets.filter(v => v.creator_username === myUsername);
+        const others = targets.length - mine.length;
+
+        let msg = `确定永久删除选中的 ${targets.length} 个社区声音？此操作不可逆！\n\n`
+            + `· 你创建的：${mine.length} 个（可删除）\n`
+            + `· 他人/分享进来：${others} 个（将尝试删除，无权限会显示失败）`;
+        if (!confirm(msg)) return;
+
+        const delBtn = document.getElementById('hvt-mv-del-sel');
+        spaceDelRunning = true; spaceDelAbort = false;
+        let removed = 0, failed = 0;
+        for (let i = 0; i < targets.length; i++) {
+            if (spaceDelAbort) break;
+            if (delBtn) delBtn.textContent = `■ 停止 (${i + 1}/${targets.length})`;
+            const v = targets[i];
+            try {
+                await heygenApi('/v1/pacific/voice.delete', { method: 'POST', headers: v._space ? { 'x-space-id': v._space } : {}, body: JSON.stringify({ voice_id: v.voice_id }) });
+                spaceSelectedIds.delete(v.voice_id);
+                spaceVoices = spaceVoices.filter(x => x.voice_id !== v.voice_id);
+                removed++;
+            } catch (e) { failed++; }
+            if (i < targets.length - 1 && !spaceDelAbort) await mvShareSleep(1500 + Math.random() * 1500);
+        }
+        try { localStorage.setItem(SPACE_CACHE_KEY, JSON.stringify({ ts: Date.now(), voices: spaceVoices, members: [...spaceMembers] })); } catch {}
+        spaceDelRunning = false;
+        mvRenderList();
+        const tail = spaceDelAbort ? '（已停止）' : '';
+        showToast(failed ? `已删除 ${removed} 个，${failed} 个失败${tail}` : `✅ 已删除 ${removed} 个声音${tail}`, failed ? 'error' : 'success', 4000);
     }
 
     function mvReadCache() {
@@ -2165,6 +2407,112 @@
         } catch {}
     }
 
+    // ─── 社区（Space）声音 ───────────────────────────────────────────────────
+    // 根因：voice.list 不带 x-space-id 头时只返回分享到本人邮箱的声音；
+    // 带上所属 Space 的 x-space-id 头才能拿到整个社区的声音。
+
+    function spaceReadCache() {
+        try {
+            const c = JSON.parse(localStorage.getItem(SPACE_CACHE_KEY));
+            if (!c || !Array.isArray(c.voices)) return null;
+            return c;
+        } catch { return null; }
+    }
+
+    async function fetchSpaces() {
+        try {
+            const d = await heygenApi('/v1/space.list');
+            spacesList = (d.list || []).map(s => ({ id: s.space_id, name: s.space_name }));
+        } catch { spacesList = []; }
+        return spacesList;
+    }
+
+    async function fetchSpaceMembers(spaceId) {
+        try {
+            const d = await heygenApi('/v1/space/user.list?include_superadmins=true', { headers: { 'x-space-id': spaceId } });
+            const arr = Array.isArray(d) ? d : (d.list || d.users || []); // user.list 的 data 直接是数组
+            return arr.map(u => u.username).filter(Boolean);
+        } catch { return []; }
+    }
+
+    // creator ∈ Space 成员 → 自生成；否则分享进来。
+    // 成员名单暂未取到时，用 shared_to 是否含邮箱兜底判定。
+    function classifyOrigin(v) {
+        if (spaceMembers.size) return spaceMembers.has(v.creator_username) ? 'self' : 'shared';
+        const keys = Object.keys(v.spaces_or_users_shared_to || {});
+        return keys.some(k => k.includes('@')) ? 'shared' : 'self';
+    }
+
+    // 后台静默慢速拉取：所属 Space 逐页取，页间加随机延迟防风控，不设分页上限。
+    async function spacePrefetch() {
+        if (spaceFetchRunning) return;
+        spaceFetchRunning = true;
+        try {
+            if (!myUsername) myUsername = await expGetMyUsername();
+            await fetchSpaces();
+
+            const memberSet = new Set();
+            for (const sp of spacesList) {
+                (await fetchSpaceMembers(sp.id)).forEach(u => memberSet.add(u));
+                await mvShareSleep(600 + Math.random() * 600);
+            }
+            spaceMembers = memberSet;
+
+            const collected = [];
+            const seen = new Set();
+            for (const sp of spacesList) {
+                let token = null;
+                for (;;) {                                   // 不设上限，拉到 next_token 为空
+                    let url = '/v2/pacific/voice_clone/voice.list?page_size=50';
+                    if (token) url += '&next_token=' + encodeURIComponent(token);
+                    // 单页重试：瞬时错误（限流/非100）不应中断整段分页
+                    let data = null;
+                    for (let attempt = 0; attempt < 4 && !data; attempt++) {
+                        try { data = await heygenApi(url, { headers: { 'x-space-id': sp.id } }); }
+                        catch { await mvShareSleep(1500 + Math.random() * 1500); }
+                    }
+                    if (!data) break; // 多次重试仍失败 → 放弃该 Space（无 token 也无法继续）
+                    const list = data.data || data.list || data.voices || [];
+                    const fresh = list.filter(v => v.voice_id && !seen.has(v.voice_id));
+                    if (!fresh.length) break;                 // 去重终止（API 耗尽会重复返回首页）
+                    fresh.forEach(v => {
+                        seen.add(v.voice_id);
+                        v._space = sp.id;
+                        v._spaceName = sp.name;
+                        v._origin = classifyOrigin(v);
+                        collected.push(v);
+                    });
+                    token = data.next_pagination_token || null;
+                    if (!token) break;
+                    await mvShareSleep(700 + Math.random() * 800); // 慢速防风控
+                }
+            }
+            spaceVoices = collected;
+            try { localStorage.setItem(SPACE_CACHE_KEY, JSON.stringify({ ts: Date.now(), voices: collected, members: [...spaceMembers] })); } catch {}
+
+            // 面板已打开 → 刷新展示
+            const aisOverlay = document.getElementById('hvt-ais-overlay');
+            if (aisOverlay && aisOverlay.style.display !== 'none') {
+                const s = document.getElementById('hvt-ais-search');
+                aisSearchVoices(s ? s.value : '');
+            }
+            const mvOverlay = document.getElementById('hvt-mv-overlay');
+            if (mvOverlay && mvOverlay.style.display !== 'none' && mvViewMode === 'space') mvRenderList();
+        } finally {
+            spaceFetchRunning = false;
+        }
+    }
+
+    // 缓存命中即用，并在后台启动一次刷新（SWR）
+    function spaceInit() {
+        const c = spaceReadCache();
+        if (c) {
+            spaceVoices = c.voices;
+            spaceMembers = new Set(c.members || []);
+        }
+        setTimeout(spacePrefetch, 3000);
+    }
+
     // ─── AI Studio Quick Voice Switch ────────────────────────────────────────
     let aisSearchResults = [];
     let aisFallbackToken = 0; // incremented to cancel an in-flight fallback search
@@ -2172,7 +2520,7 @@
     // aisIsModalOpen: detects both AI Studio "Select Voice" and Avatar Shots "Choose avatar voice"
     function aisIsModalOpen() {
         return !![...document.querySelectorAll('[role="dialog"]')]
-            .find(d => d.textContent.includes('Select Voice') || d.textContent.includes('Choose avatar voice'));
+            .find(d => d.textContent.includes('Select Voice') || d.textContent.includes('Choose avatar voice') || d.textContent.includes('Select avatar voice'));
     }
 
     // On Avatar Shots, the Voice toolbar button has an #audio svg icon
@@ -2182,10 +2530,26 @@
             .find(b => b.querySelector('svg use[href="#audio"]'));
     }
 
+    // On the My Avatars detail page (/avatar/my-avatars/<id>) the voice control is
+    // the top-bar dropdown (aria-haspopup="menu" + #chevron-down) sitting next to the
+    // #play-s preview button. Clicking it opens a menu with "Switch voice".
+    function aisFindAvatarVoiceMenuBtn() {
+        const playBtn = [...document.querySelectorAll('button')]
+            .find(b => !b.closest('#hvt-root') && !b.closest('#hvt-fab-strip') && b.querySelector('svg use[href="#play-s"]'));
+        if (!playBtn) return null;
+        let scope = playBtn.parentElement;
+        for (let i = 0; i < 3 && scope; i++, scope = scope.parentElement) {
+            const btn = [...scope.querySelectorAll('button[aria-haspopup="menu"]')]
+                .find(b => b.querySelector('svg use[href="#chevron-down"]'));
+            if (btn) return btn;
+        }
+        return null;
+    }
+
     // aisBridgeSwitch: asks ais-bridge.js (MAIN world) to call onSelect via CustomEvent.
     // Passes full voiceObj so bridge can switch even if the voice isn't rendered in the modal.
     function aisBridgeSwitch(targetVoiceId) {
-        const voiceObj = mvVoices.find(v => v.voice_id === targetVoiceId) || db.voices[targetVoiceId] || null;
+        const voiceObj = mvVoices.find(v => v.voice_id === targetVoiceId) || spaceVoices.find(v => v.voice_id === targetVoiceId) || db.voices[targetVoiceId] || null;
         return new Promise((resolve) => {
             const handler = (e) => {
                 document.removeEventListener('hvt-ais-result', handler);
@@ -2220,22 +2584,31 @@
 
         if (!aisIsModalOpen()) {
             if (isAvatarShots) {
-                // Avatar Shots: click Voice toolbar button (#audio icon) → Voice modal → Switch
+                let opened = false;
+                // 路径一 — Avatar Shots 编辑器：Voice 工具栏按钮(#audio) → Voice 弹窗 → Switch
                 const voiceToolbarBtn = aisFindAvatarShotsVoiceBtn();
-                if (!voiceToolbarBtn) {
-                    setStatus('未找到 Voice 按钮，请确认当前在 Avatar Shots 页面', 'error');
+                if (voiceToolbarBtn) {
+                    voiceToolbarBtn.click();
+                    await new Promise(r => setTimeout(r, 400));
+                    const switchInModal = [...document.querySelectorAll('[role="dialog"] button')]
+                        .find(b => b.textContent.includes('Switch'));
+                    if (switchInModal) { switchInModal.click(); opened = true; }
+                }
+                // 路径二 — My Avatars 详情页：顶部声音下拉 → 菜单「Switch voice」
+                if (!opened) {
+                    const menuBtn = aisFindAvatarVoiceMenuBtn();
+                    if (menuBtn) {
+                        menuBtn.click();
+                        await new Promise(r => setTimeout(r, 350));
+                        const switchItem = [...document.querySelectorAll('[role="menuitem"], [role="menu"] button')]
+                            .find(b => /switch voice/i.test(b.textContent || ''));
+                        if (switchItem) { switchItem.click(); opened = true; }
+                    }
+                }
+                if (!opened) {
+                    setStatus('未找到声音入口，请确认在 Avatar Shots 或头像详情页', 'error');
                     return;
                 }
-                voiceToolbarBtn.click();
-                await new Promise(r => setTimeout(r, 400));
-                // Now find the Switch → button inside the Voice modal
-                const switchInModal = [...document.querySelectorAll('[role="dialog"] button')]
-                    .find(b => b.textContent.includes('Switch'));
-                if (!switchInModal) {
-                    setStatus('Voice 弹窗未出现，请重试', 'error');
-                    return;
-                }
-                switchInModal.click();
             } else {
                 // AI Studio: find Switch button directly, or navigate from Avatar & Voice panel
                 let heySwitchBtn = [...document.querySelectorAll('button')]
@@ -2296,11 +2669,11 @@
         }
 
         if (result.success) {
-            // Avatar Shots needs an explicit Save changes to apply the selection
+            // Avatar 页需要显式确认才会应用：编辑器是「Save changes」，My Avatars 详情是「Set default」
             if (isAvatarShots) {
                 await new Promise(r => setTimeout(r, 200));
                 const saveBtn = [...document.querySelectorAll('[role="dialog"] button')]
-                    .find(b => b.textContent.trim() === 'Save changes');
+                    .find(b => { const t = b.textContent.trim(); return t === 'Save changes' || t === 'Set default'; });
                 if (saveBtn) saveBtn.click();
             }
             setStatus(`✅ 已切换到「${result.name}」`, 'success');
@@ -2316,9 +2689,10 @@
         const seen = new Set();
         const results = [];
 
-        // My Voices first, then db (library)
+        // My Voices first, then community (space), then db (library)
         const all = [
             ...mvVoices.map(v => ({ ...v, _src: 'my' })),
+            ...spaceVoices.map(v => ({ ...v, _src: 'space' })),
             ...Object.values(db.voices).map(v => ({ ...v, _src: 'lib' })),
         ];
 
@@ -2368,36 +2742,51 @@
         if (listEl && aisSearchResults.length === 0) {
             listEl.innerHTML = '<div class="hvt-ais-empty">正在实时搜索…</div>';
         }
-        let token = null;
-        for (let page = 0; page < 20; page++) {
-            if (aisFallbackToken !== myToken) return;
-            let url = '/v2/pacific/voice_clone/voice.list?page_size=50';
-            if (token) url += '&next_token=' + encodeURIComponent(token);
-            let data;
-            try {
-                data = await heygenApi(url);
-            } catch (e) {
+        // 逐页搜索：先个人上下文，再每个所属 Space（带 x-space-id），直到搜到。
+        if (!spacesList.length) { try { await fetchSpaces(); } catch {} }
+        const contexts = [{ id: null }, ...spacesList];
+        for (const ctx of contexts) {
+            let token = null;
+            const seenPage = new Set();
+            for (;;) {                                   // 不设上限，拉到 next_token 为空
                 if (aisFallbackToken !== myToken) return;
-                if (listEl && aisSearchResults.length === 0) listEl.innerHTML = `<div class="hvt-ais-empty" style="color:#dc2626">实时搜索出错: ${esc(e.message)}</div>`;
-                return;
-            }
-            if (aisFallbackToken !== myToken) return;
-            const list = data.data || data.list || data.voices || [];
-            const matched = list.filter(v =>
-                (v.voice_id || '').toLowerCase().includes(query) ||
-                (v.display_name || '').toLowerCase().includes(query)
-            );
-            if (matched.length > 0) {
-                const existingIds = new Set(mvVoices.map(v => v.voice_id));
-                for (const v of matched) {
-                    if (!existingIds.has(v.voice_id)) mvVoices.push(v);
+                let url = '/v2/pacific/voice_clone/voice.list?page_size=50';
+                if (token) url += '&next_token=' + encodeURIComponent(token);
+                let data = null;
+                for (let attempt = 0; attempt < 4 && !data; attempt++) {
+                    if (aisFallbackToken !== myToken) return;
+                    try { data = await heygenApi(url, ctx.id ? { headers: { 'x-space-id': ctx.id } } : {}); }
+                    catch { await mvShareSleep(1200 + Math.random() * 1200); }
                 }
-                const searchEl = document.getElementById('hvt-ais-search');
-                aisSearchVoices(searchEl ? searchEl.value : query);
-                return;
+                if (aisFallbackToken !== myToken) return;
+                if (!data) break; // 重试仍失败 → 跳到下一个上下文
+                const list = data.data || data.list || data.voices || [];
+                if (!list.some(v => v.voice_id && !seenPage.has(v.voice_id))) break; // 去重终止
+                list.forEach(v => { if (v.voice_id) seenPage.add(v.voice_id); });
+                const matched = list.filter(v =>
+                    (v.voice_id || '').toLowerCase().includes(query) ||
+                    (v.display_name || '').toLowerCase().includes(query)
+                );
+                if (matched.length > 0) {
+                    if (ctx.id) {
+                        const existing = new Set(spaceVoices.map(v => v.voice_id));
+                        for (const v of matched) {
+                            if (existing.has(v.voice_id)) continue;
+                            v._space = ctx.id; v._spaceName = ctx.name;
+                            v._origin = classifyOrigin(v);
+                            spaceVoices.push(v);
+                        }
+                    } else {
+                        const existing = new Set(mvVoices.map(v => v.voice_id));
+                        for (const v of matched) if (!existing.has(v.voice_id)) mvVoices.push(v);
+                    }
+                    const searchEl = document.getElementById('hvt-ais-search');
+                    aisSearchVoices(searchEl ? searchEl.value : query);
+                    return;
+                }
+                token = data.next_pagination_token || null;
+                if (!token) break;
             }
-            token = data.next_pagination_token || null;
-            if (!token) break;
         }
         if (aisFallbackToken !== myToken) return;
         if (listEl && aisSearchResults.length === 0) listEl.innerHTML = `<div class="hvt-ais-empty" style="color:#dc2626">实时搜索完毕，未找到「${esc(query)}」</div>`;
@@ -2417,12 +2806,17 @@
             const name = v.display_name || id;
             const gender = (v.gender || '').toLowerCase();
             const genderIcon = gender === 'female' ? '♀' : gender === 'male' ? '♂' : '';
-            const isMyVoice = v._src === 'my';
+            let srcIcon = '📚', srcLabel = '声音库';
+            if (v._src === 'my') { srcIcon = '🎤'; srcLabel = '我的声音'; }
+            else if (v._src === 'space') {
+                if (v._origin === 'shared') { srcIcon = '🟠'; srcLabel = '社区·分享进来'; }
+                else { srcIcon = '🟢'; srcLabel = '社区·自生成'; }
+            }
             const row = document.createElement('div');
             row.className = 'hvt-ais-row';
             row.title = `Voice ID: ${id}\n点击切换`;
             row.innerHTML = `
-                <span class="hvt-ais-src" title="${isMyVoice ? '我的声音' : '声音库'}">${isMyVoice ? '🎤' : '📚'}</span>
+                <span class="hvt-ais-src" title="${srcLabel}">${srcIcon}</span>
                 <span class="hvt-ais-name">${esc(name)}</span>
                 ${genderIcon ? `<span class="hvt-ais-gender ${gender === 'female' ? 'hvt-f' : 'hvt-m'}">${genderIcon}</span>` : ''}
                 <span class="hvt-ais-id">${esc(id.slice(0, 8))}…</span>
@@ -2590,7 +2984,7 @@
               </div>
               <div id="hvt-ais-status"></div>
               <div id="hvt-ais-list"></div>
-              <div id="hvt-ais-footer">点击声音行即可切换 · 🎤 我的声音 &nbsp;📚 声音库</div>
+              <div id="hvt-ais-footer">点击声音行即可切换 · 🎤 我的声音 &nbsp;🟢 社区·自生成 &nbsp;🟠 社区·分享 &nbsp;📚 声音库</div>
             </div>
         `;
         document.body.appendChild(aisRoot);
@@ -2606,6 +3000,17 @@
                 <button id="hvt-vd-close" title="关闭">✕</button>
               </div>
               <div id="hvt-vd-body">
+                <div class="hvt-vd-form-row">
+                  <label class="hvt-vd-label">上传头像（HeyGen 分析人脸自动生成提示词，可选）</label>
+                  <div id="hvt-vd-photo-row">
+                    <label id="hvt-vd-photo-drop" for="hvt-vd-photo-input">
+                      <img id="hvt-vd-photo-thumb" alt="">
+                      <span id="hvt-vd-photo-placeholder">📷 点击选择头像图片</span>
+                    </label>
+                    <input id="hvt-vd-photo-input" type="file" accept="image/*" hidden>
+                    <span id="hvt-vd-photo-status"></span>
+                  </div>
+                </div>
                 <div class="hvt-vd-form-row">
                   <label class="hvt-vd-label">提示词</label>
                   <textarea id="hvt-vd-prompt" class="hvt-vd-textarea" placeholder="描述声音特征：年龄、性别、风格、口音、情绪……&#10;例：A high-pitched, energetic voice of a 4-year-old American boy with a slight childish lisp."></textarea>
@@ -2635,6 +3040,7 @@
                 <div style="display:flex;align-items:center;gap:8px">
                   <span id="hvt-mv-count" style="font-size:13px;color:#8b8abf"></span>
                   <span id="hvt-mv-sel-count" style="font-size:13px;color:#a78bfa"></span>
+                  <button id="hvt-mv-space-toggle" class="hvt-btn" title="切换显示：本号自带声音 / 社区（Space）声音">🌐 社区声音</button>
                   <button id="hvt-mv-exp" class="hvt-btn" title="分享到期清理：撤销超过设定天数的对外分享">⏰ 到期清理</button>
                   <button id="hvt-mv-refresh" class="hvt-btn" title="刷新列表">↺ 刷新</button>
                   <button id="hvt-mv-dl-sel" class="hvt-btn hvt-btn-primary" title="下载已勾选的声音" style="display:none">⬇ 下载已选</button>
@@ -3102,6 +3508,11 @@
         // Voice Design modal
         document.getElementById('hvt-vd-close').addEventListener('click', closeVoiceDesign);
         document.getElementById('hvt-vd-generate').addEventListener('click', vdGenerate);
+        document.getElementById('hvt-vd-photo-input').addEventListener('change', (e) => {
+            const file = e.target.files && e.target.files[0];
+            e.target.value = ''; // 允许重复选同一文件
+            if (file) vdHandlePhotoFile(file);
+        });
         document.getElementById('hvt-vd-overlay').addEventListener('click', (e) => {
             if (e.target === document.getElementById('hvt-vd-overlay')) closeVoiceDesign();
         });
@@ -3129,12 +3540,18 @@
         // My Voices modal
         document.getElementById('hvt-btn-my-voices').addEventListener('click', openMyVoices);
         document.getElementById('hvt-mv-close').addEventListener('click', closeMyVoices);
-        document.getElementById('hvt-mv-refresh').addEventListener('click', () => mvLoadVoices(true));
+        document.getElementById('hvt-mv-refresh').addEventListener('click', () => {
+            if (mvViewMode === 'space') spacePrefetch();
+            else mvLoadVoices(true);
+        });
+        document.getElementById('hvt-mv-space-toggle').addEventListener('click', () => {
+            mvSetViewMode(mvViewMode === 'space' ? 'self' : 'space');
+        });
         document.getElementById('hvt-mv-search').addEventListener('input', mvRenderList);
         document.getElementById('hvt-mv-dl-all').addEventListener('click', mvDownloadSelected);
         document.getElementById('hvt-mv-dl-sel').addEventListener('click', mvDownloadSelected);
         document.getElementById('hvt-mv-del-sel').addEventListener('click', () => {
-            if (mvDelRunning) { mvDelAbort = true; if (mvShareWaitCancel) mvShareWaitCancel(); }
+            if (mvDelRunning || spaceDelRunning) { mvDelAbort = true; spaceDelAbort = true; if (mvShareWaitCancel) mvShareWaitCancel(); }
             else mvDeleteSelected();
         });
         document.getElementById('hvt-mv-overlay').addEventListener('click', (e) => {
@@ -3228,6 +3645,7 @@
     function init() {
         loadDb();
         buildUI();
+        spaceInit();                       // 加载社区声音缓存并后台慢速刷新
         setTimeout(expAutoCleanRun, 8000); // 若已开启自动清理，加载后在后台执行
     }
 
