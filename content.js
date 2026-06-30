@@ -920,6 +920,72 @@
         }, duration);
     }
 
+    // ─── Update banner (GitHub Releases) ──────────────────────────────────────
+    function initUpdateCheck() {
+        const banner = document.getElementById('hvt-update-banner');
+        if (!banner || !chrome.runtime?.id) return;
+        chrome.runtime.sendMessage({ type: 'hvt_get_update' }, (res) => {
+            if (chrome.runtime.lastError || !res || !res.hasUpdate) return;
+            renderUpdateBanner(res);
+        });
+    }
+
+    function renderUpdateBanner(info) {
+        const banner = document.getElementById('hvt-update-banner');
+        banner.classList.remove('hvt-ub-guide');
+        banner.style.display = '';
+        banner.innerHTML = `
+            <span class="hvt-ub-icon">🔔</span>
+            <span class="hvt-ub-text">发现新版本 <b>${info.latest}</b>（当前 ${info.current}）</span>
+            <button id="hvt-ub-upgrade" class="hvt-btn hvt-btn-primary">立即升级</button>
+            <a id="hvt-ub-notes" class="hvt-btn" href="${info.htmlUrl}" target="_blank" rel="noopener">查看更新内容</a>
+            <button id="hvt-ub-ignore" class="hvt-btn">忽略此版本</button>
+        `;
+        document.getElementById('hvt-ub-upgrade').addEventListener('click', onUpdateUpgrade);
+        document.getElementById('hvt-ub-ignore').addEventListener('click', () => {
+            chrome.runtime.sendMessage({ type: 'hvt_ignore_update', version: info.latest });
+            banner.style.display = 'none';
+        });
+    }
+
+    function onUpdateUpgrade() {
+        const btn = document.getElementById('hvt-ub-upgrade');
+        btn.disabled = true;
+        btn.textContent = '下载中…';
+        chrome.runtime.sendMessage({ type: 'hvt_download_update' }, (res) => {
+            if (chrome.runtime.lastError || !res || !res.ok) {
+                btn.disabled = false;
+                btn.textContent = '立即升级';
+                const err = (res && res.error) || chrome.runtime.lastError?.message || '未知错误';
+                showToast('下载失败：' + err, 'error', 4000);
+                return;
+            }
+            showUpdateGuide();
+        });
+    }
+
+    function showUpdateGuide() {
+        const banner = document.getElementById('hvt-update-banner');
+        banner.classList.add('hvt-ub-guide');
+        banner.innerHTML = `
+            <span class="hvt-ub-icon">✅</span>
+            <span class="hvt-ub-text">新版 zip 已下载到「下载」文件夹。升级步骤：① 打开 <code>chrome://extensions</code> → ② 解压 zip → ③ 移除旧版「人声筛选工具」→ ④ 点「加载已解压的扩展程序」选中解压后的文件夹。</span>
+            <button id="hvt-ub-copy" class="hvt-btn hvt-btn-primary">复制 chrome://extensions</button>
+            <button id="hvt-ub-done" class="hvt-btn">知道了</button>
+        `;
+        document.getElementById('hvt-ub-copy').addEventListener('click', async () => {
+            try {
+                await navigator.clipboard.writeText('chrome://extensions');
+                showToast('✅ 已复制，粘贴到地址栏回车打开', 'success', 2500);
+            } catch {
+                showToast('复制失败，请手动在地址栏输入 chrome://extensions', 'error', 3500);
+            }
+        });
+        document.getElementById('hvt-ub-done').addEventListener('click', () => {
+            banner.style.display = 'none';
+        });
+    }
+
     // ─── Check if description column has any content ──────────────────────────
     function hasAnyDescription() {
         return Object.values(db.voices).some(v => v.description && v.description.trim());
@@ -2924,6 +2990,8 @@
     </div>
   </div>
 
+  <div id="hvt-update-banner" style="display:none"></div>
+
   <div id="hvt-filters">
     <div class="hvt-filter-row">
       <select id="hvt-f-lang"   class="hvt-select"><option value="">所有语言</option></select>
@@ -3672,6 +3740,7 @@
     function init() {
         loadDb();
         buildUI();
+        initUpdateCheck();                 // 检查 GitHub 是否有新版本并提示升级
         spaceInit();                       // 加载社区声音缓存并后台慢速刷新
         setTimeout(expAutoCleanRun, 8000); // 若已开启自动清理，加载后在后台执行
     }

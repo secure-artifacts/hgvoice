@@ -127,6 +127,11 @@
 
 ## 版本记录
 
+### v1.8.0
+- **新增自动更新提示**：后台每 6 小时检查 GitHub Releases（`secure-artifacts/hgvoice`）最新版本，发现新版时在面板顶部弹出横幅，显示当前版本与最新版本号
+- 点「立即升级」自动下载新版 zip 到「下载」文件夹，并引导用户在 `chrome://extensions` 解压加载完成升级（Chrome 不允许手动加载的扩展自我重装，故最后一步需手动）；支持「查看更新内容」跳转 Release 页、「忽略此版本」不再提示
+- 新增权限：`storage`、`alarms`、`https://api.github.com/*`
+
 ### v1.7.1
 - **AI Studio / Avatar Shots / My Avatars 换声音支持多语言界面**：修复界面切换到中文（简体 / 繁体）后无法换声音的问题。根因是「切换 / 确认」按钮、弹窗、标签页的定位写死了英文文案（`'Switch'`、`'Save changes'`、`'Select Voice'`），界面非英文时全部失配
 - 改为**语言无关锚点**：图标 sprite id 集合（`#transition` / `#refresh` / `#arrow-right`，三页各异）、`[role="dialog"][data-state="open"]` + `#play-s` 预览按钮、`role="tab"` 标签、`tw-bg-btn-primary` 主按钮样式；文字匹配仅作兜底（覆盖 en / 简 / 繁）

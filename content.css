@@ -119,6 +119,36 @@
 }
 #hvt-close:hover { background: #dbeafe; color: #1d4ed8; border-color: #93c5fd; }
 
+/* ── Update banner ──────────────────────────────────────────────────────── */
+#hvt-update-banner {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 9px 14px;
+    background: #fffbeb;                 /* amber-50 */
+    border-bottom: 1px solid #fcd34d;    /* amber-300 */
+    color: #92400e;                      /* amber-800 */
+    font-size: 13px;
+    flex-shrink: 0;
+}
+#hvt-update-banner.hvt-ub-guide {
+    background: #f0fdf4;                  /* green-50 */
+    border-bottom-color: #86efac;        /* green-300 */
+    color: #166534;                      /* green-800 */
+}
+#hvt-update-banner .hvt-ub-icon { font-size: 15px; line-height: 1; }
+#hvt-update-banner .hvt-ub-text { flex: 1 1 240px; line-height: 1.5; }
+#hvt-update-banner .hvt-ub-text b { font-weight: 700; }
+#hvt-update-banner .hvt-ub-text code {
+    background: rgba(0,0,0,0.06);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+}
+#hvt-update-banner a.hvt-btn { text-decoration: none; display: inline-flex; align-items: center; }
+
 /* ── Buttons ────────────────────────────────────────────────────────────── */
 .hvt-btn {
     padding: 6px 13px;
