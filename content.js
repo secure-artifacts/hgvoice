@@ -2517,10 +2517,40 @@
     let aisSearchResults = [];
     let aisFallbackToken = 0; // incremented to cancel an in-flight fallback search
 
-    // aisIsModalOpen: detects both AI Studio "Select Voice" and Avatar Shots "Choose avatar voice"
+    // ── Language-independent UI matchers ─────────────────────────────────────
+    // HeyGen localizes every button label (en / 简体 / 繁體 / …), so matching on
+    // English text breaks the moment the user changes language. We anchor on
+    // language-independent signals — sprite-icon ids, ARIA roles, primary-button
+    // styling — and only fall back to text patterns (covering en + 简 + 繁).
+    //
+    // Verified on AI Studio / My Avatars / Avatar Shots in zh-Hans and zh-Hant:
+    //   · the "Switch" control's icon differs per page (#transition / #refresh /
+    //     #arrow-right) → match a set, not one id
+    //   · the open voice-picker dialog always contains a #play-s preview button
+    //   · voice tabs carry role="tab"
+    //   · the confirm button is the only primary-styled button that also has text
+    const SWITCH_ICON_SET = ['#transition', '#refresh', '#arrow-right'];
+    const SWITCH_TEXT_RE  = /switch|切换|切換/i;
+    const CONFIRM_TEXT_RE = /save changes|set default|保存更改|儲存更改|设为默认|設為預設/i;
+
+    const elHasAnyIcon = (el, ids) => ids.some(id => el.querySelector(`svg use[href="${id}"]`));
+    const isHvtUI = (el) => !!(el.closest('#hvt-root') || el.closest('#hvt-fab-strip') || el.closest('#hvt-ais-overlay'));
+    // a "switch voice" control: matched by icon first, text fallback second
+    const isSwitchEl = (el) => !isHvtUI(el) && (elHasAnyIcon(el, SWITCH_ICON_SET) || SWITCH_TEXT_RE.test(el.textContent || ''));
+    // the modal's apply/confirm button: the primary-styled button carrying text
+    // (icon-only primary controls like #play-s/#arrow-right are excluded)
+    const isConfirmBtn = (b) => !isHvtUI(b) &&
+        ((b.className.includes('tw-bg-btn-primary') && b.textContent.trim()) || CONFIRM_TEXT_RE.test(b.textContent || ''));
+
+    // aisIsModalOpen: the voice-picker dialog. Title text varies by language, so
+    // detect an open radix dialog containing a #play-s preview, with a localized
+    // title fallback (en / 简 / 繁).
     function aisIsModalOpen() {
-        return !![...document.querySelectorAll('[role="dialog"]')]
-            .find(d => d.textContent.includes('Select Voice') || d.textContent.includes('Choose avatar voice') || d.textContent.includes('Select avatar voice'));
+        return [...document.querySelectorAll('[role="dialog"][data-state="open"]')]
+            .some(d => !isHvtUI(d) && (
+                d.querySelector('svg use[href="#play-s"]') ||
+                /select voice|avatar voice|选择音色|選擇音色|的声音|的語音|的语音/i.test(d.textContent)
+            ));
     }
 
     // On Avatar Shots, the Voice toolbar button has an #audio svg icon
@@ -2590,8 +2620,8 @@
                 if (voiceToolbarBtn) {
                     voiceToolbarBtn.click();
                     await new Promise(r => setTimeout(r, 400));
-                    const switchInModal = [...document.querySelectorAll('[role="dialog"] button')]
-                        .find(b => b.textContent.includes('Switch'));
+                    const switchInModal = [...document.querySelectorAll('[role="dialog"][data-state="open"] button')]
+                        .find(isSwitchEl);
                     if (switchInModal) { switchInModal.click(); opened = true; }
                 }
                 // 路径二 — My Avatars 详情页：顶部声音下拉 → 菜单「Switch voice」
@@ -2601,7 +2631,7 @@
                         menuBtn.click();
                         await new Promise(r => setTimeout(r, 350));
                         const switchItem = [...document.querySelectorAll('[role="menuitem"], [role="menu"] button')]
-                            .find(b => /switch voice/i.test(b.textContent || ''));
+                            .find(isSwitchEl);
                         if (switchItem) { switchItem.click(); opened = true; }
                     }
                 }
@@ -2611,9 +2641,7 @@
                 }
             } else {
                 // AI Studio: find Switch button directly, or navigate from Avatar & Voice panel
-                let heySwitchBtn = [...document.querySelectorAll('button')]
-                    .filter(b => !b.closest('#hvt-fab-strip') && !b.closest('#hvt-root') && !b.closest('#hvt-ais-overlay'))
-                    .find(b => b.textContent.trim() === 'Switch');
+                let heySwitchBtn = [...document.querySelectorAll('button')].find(isSwitchEl);
 
                 if (!heySwitchBtn) {
                     // Voice row has no <img> (avatar row does); both share tw-cursor-pointer + tw-rounded-md
@@ -2624,9 +2652,7 @@
                     if (voiceRow) {
                         voiceRow.dispatchEvent(new MouseEvent('click', { bubbles: true }));
                         await new Promise(r => setTimeout(r, 400));
-                        heySwitchBtn = [...document.querySelectorAll('button')]
-                            .filter(b => !b.closest('#hvt-fab-strip') && !b.closest('#hvt-root') && !b.closest('#hvt-ais-overlay'))
-                            .find(b => b.textContent.trim() === 'Switch');
+                        heySwitchBtn = [...document.querySelectorAll('button')].find(isSwitchEl);
                     }
                 }
 
@@ -2654,13 +2680,13 @@
         // Try current (first) tab — bridge handles modal search internally if needed
         let result = await aisBridgeSwitch(targetVoiceId);
 
-        // If not found, iterate remaining tabs
+        // If not found, iterate the modal's tabs (我的语音 / HeyGen 库 / …).
+        // Tabs carry role="tab" (language-independent), so iterate them all.
         if (!result.success) {
-            for (const tabLabel of ['My voices', 'HeyGen library']) {
-                const tab = [...document.querySelectorAll('[role="tab"], button')]
-                    .filter(el => !el.closest('#hvt-ais-overlay') && !el.closest('#hvt-fab-strip') && !el.closest('#hvt-root'))
-                    .find(el => el.textContent.trim() === tabLabel);
-                if (!tab) continue;
+            const tabs = [...document.querySelectorAll('[role="dialog"][data-state="open"] [role="tab"]')]
+                .filter(el => !isHvtUI(el));
+            for (const tab of tabs) {
+                if (tab.getAttribute('aria-selected') === 'true') continue;
                 tab.click();
                 await new Promise(r => setTimeout(r, 600));
                 result = await aisBridgeSwitch(targetVoiceId);
@@ -2669,11 +2695,12 @@
         }
 
         if (result.success) {
-            // Avatar 页需要显式确认才会应用：编辑器是「Save changes」，My Avatars 详情是「Set default」
+            // Avatar 页需要显式确认才会应用：编辑器是「保存更改」，My Avatars 详情是「设为默认」。
+            // 文案随语言变，按"主按钮且带文字"定位（纯图标主按钮 #play-s/#arrow-right 自动排除）。
             if (isAvatarShots) {
                 await new Promise(r => setTimeout(r, 200));
-                const saveBtn = [...document.querySelectorAll('[role="dialog"] button')]
-                    .find(b => { const t = b.textContent.trim(); return t === 'Save changes' || t === 'Set default'; });
+                const saveBtn = [...document.querySelectorAll('[role="dialog"][data-state="open"] button')]
+                    .find(isConfirmBtn);
                 if (saveBtn) saveBtn.click();
             }
             setStatus(`✅ 已切换到「${result.name}」`, 'success');

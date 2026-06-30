@@ -80,6 +80,7 @@
 - **绕过「See More」分页限制**：预先通过 API 拉取全量「我的声音」缓存，切换时无论目标声音是否渲染在弹窗内，均可直接命中
 - **AI Studio**：自动处理 Avatar & Voice → Edit Voice → Switch 的导航链路，打开面板即可直接使用
 - **Avatar Shots**：自动完成 Voice 按钮 → Switch → 选择 → Save changes 的完整流程
+- **多语言无关定位**：识别页面「切换 / 确认」按钮、弹窗、标签页时不依赖界面语言文字，改用图标 sprite id、`role="tab"`、主按钮样式等语言无关锚点（文字仅作兜底），英文 / 简体 / 繁体界面均可正常换声音
 
 ---
 
@@ -125,6 +126,14 @@
 ---
 
 ## 版本记录
+
+### v1.7.1
+- **AI Studio / Avatar Shots / My Avatars 换声音支持多语言界面**：修复界面切换到中文（简体 / 繁体）后无法换声音的问题。根因是「切换 / 确认」按钮、弹窗、标签页的定位写死了英文文案（`'Switch'`、`'Save changes'`、`'Select Voice'`），界面非英文时全部失配
+- 改为**语言无关锚点**：图标 sprite id 集合（`#transition` / `#refresh` / `#arrow-right`，三页各异）、`[role="dialog"][data-state="open"]` + `#play-s` 预览按钮、`role="tab"` 标签、`tw-bg-btn-primary` 主按钮样式；文字匹配仅作兜底（覆盖 en / 简 / 繁）
+
+### v1.7.0
+- **社区（Space）声音搜索 / 切换 / 删除**：`voice.list` 带 `x-space-id` 头才能拉到 Space 声音，自生成 / 分享按 creator 是否属成员区分，`spaceVoices` 与 `mvVoices` 分开存储
+- **My Avatars 详情页换声音**：支持在头像详情页顶部声音下拉直接切换
 
 ### v1.6.0
 - **我的声音：多选批量删除**：勾选后一键删除你自己创建的声音，强二次确认 + 仅删 `creator === 当前账号`（自动跳过他人分享的）+ 逐个延迟 + 可中断，删除接口 `POST /v1/pacific/voice.delete`
