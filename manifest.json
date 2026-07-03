@@ -1,8 +1,8 @@
 {
     "manifest_version": 3,
     "name": "人声筛选工具",
-    "version": "1.8.0",
-    "description": "HeyGen 人声筛选工具 – 声音库筛选、试听、我的声音管理、社区(Space)声音搜索/切换/删除、下载与分享到期清理",
+    "version": "1.9.0",
+    "description": "HeyGen 人声筛选工具 – 声音库筛选、试听、我的声音管理、找我的视频、社区(Space)声音搜索/切换/删除、下载与分享到期清理",
     "permissions": ["downloads", "storage", "alarms"],
     "background": {
         "service_worker": "background.js"

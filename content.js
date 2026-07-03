@@ -15,6 +15,7 @@
     const EXP_DAYS_DEFAULT = 60;
     const EXP_AUTO_KEY = 'hvt_share_auto_clean';   // '1'/'0'：是否自动清理超期分享
     const EXP_AUTO_LAST_KEY = 'hvt_share_auto_last'; // 上次自动清理时间戳（节流用）
+    const PV_LEDGER_KEY = 'hvt_project_video_ledger_v1'; // video key -> 上次所在文件夹
     const API_BASE = 'https://api2.heygen.com';
 
     // ── 语言 / 地区设置（按需修改，供不同地区用户使用）──────────────────────
@@ -225,6 +226,10 @@
     let spaceDelAbort = false;       // 停止社区删除循环
     let mvViewMode = 'self';         // 'self'=本号自带声音 | 'space'=社区声音
     let myUsername = null;           // 当前用户 username（创建者判定）
+    let pvRows = [];                 // 「我的视频」扫描结果
+    let pvScanning = false;
+    let pvAbort = false;
+    let pvLastScanMeta = null;       // { scanned, totalMine, moved }
 
     // ─── Storage ──────────────────────────────────────────────────────────────
     function loadDb() {
@@ -2579,6 +2584,432 @@
         setTimeout(spacePrefetch, 3000);
     }
 
+    // ─── Project Videos（找我的视频）──────────────────────────────────────────
+    const PV_PROJECT_TYPES = [
+        'video_translate', 'video', 'mixed',
+        'batch_video_translate', 'batch_avatar_video_translate', 'batch_video',
+    ];
+    const PV_ITEM_TYPES = [
+        'video_translate', 'video_translate_proofread', 'heygen_video',
+        'heygen_video_draft', 'interactive_video', 'video_repurpose',
+        'video_agent', 'video_agent_edit', 'batch_video', 'batch_video_translate',
+        'batch_avatar_video_translate', 'heygen_podcast', 'seedance_2',
+        'upscale_video', 'filler_removal',
+    ];
+    const PV_SCAN_CONCURRENCY = 4;
+    const PV_SCAN_MAX_PAGES_PER_FOLDER = 2; // 默认快速扫描：每夹最多 200 条，避免团队大库卡太久
+
+    function pvReadLedger() {
+        try { return JSON.parse(localStorage.getItem(PV_LEDGER_KEY)) || {}; } catch { return {}; }
+    }
+    function pvWriteLedger(ledger) {
+        try { localStorage.setItem(PV_LEDGER_KEY, JSON.stringify(ledger)); } catch {}
+    }
+    function pvLedgerKey(spaceId, videoId) {
+        return `${spaceId || 'personal'}::${videoId || ''}`;
+    }
+    function pvItemId(item) {
+        return item.video_id || item.item_id || item.id || item.resource_id || '';
+    }
+    function pvItemOwner(item) {
+        return item.username || item.creator_username || item.creator || item.created_by || '';
+    }
+    function pvProjectIdOf(item) {
+        return item.project_id || item.folder_id || item.parent_id || '';
+    }
+    function pvAppendAll(params, key, values) {
+        values.forEach(v => params.append(key, v));
+        return params;
+    }
+    function pvNormalizePath(project) {
+        const raw = project.project_path || project.path || project.paths || [];
+        let parts = [];
+        if (Array.isArray(raw)) {
+            parts = raw.map(p => typeof p === 'string' ? p : (p?.name || p?.title || '')).filter(Boolean);
+        } else if (typeof raw === 'string') {
+            parts = raw.split('/').map(s => s.trim()).filter(Boolean);
+        }
+        const name = project.name || project.title || project.project_name || '';
+        if (name && parts[parts.length - 1] !== name) parts.push(name);
+        return parts.length ? parts.join(' / ') : (name || '未命名文件夹');
+    }
+    function pvFormatDate(value) {
+        if (!value) return '-';
+        let d = null;
+        if (typeof value === 'number') d = new Date(value < 1000000000000 ? value * 1000 : value);
+        else d = new Date(String(value).replace(' ', 'T'));
+        if (!d || Number.isNaN(d.getTime())) return String(value);
+        return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+    }
+    function pvDateMs(value) {
+        if (!value) return 0;
+        if (typeof value === 'number') return value < 1000000000000 ? value * 1000 : value;
+        const t = new Date(String(value).replace(' ', 'T')).getTime();
+        return Number.isFinite(t) ? t : 0;
+    }
+    function pvIsOlderThan(row, days) {
+        if (!days) return true;
+        const t = pvDateMs(row.createdTs);
+        if (!t) return false;
+        return t <= Date.now() - days * 24 * 60 * 60 * 1000;
+    }
+    function pvAgeDays() {
+        const ageEl = document.getElementById('hvt-pv-age');
+        const customEl = document.getElementById('hvt-pv-age-custom');
+        if (ageEl?.value === 'custom') {
+            return Math.max(0, parseInt(customEl?.value || '0', 10) || 0);
+        }
+        return Math.max(0, parseInt(ageEl?.value || '0', 10) || 0);
+    }
+    function pvUpdateAgeCustomVisibility() {
+        const ageEl = document.getElementById('hvt-pv-age');
+        const customEl = document.getElementById('hvt-pv-age-custom');
+        if (!ageEl || !customEl) return;
+        customEl.style.display = ageEl.value === 'custom' ? 'block' : 'none';
+        if (ageEl.value === 'custom') customEl.focus();
+    }
+    function pvFolderUrl(row) {
+        const base = 'https://app.heygen.com/projects';
+        return row.projectId ? `${base}?project_id=${encodeURIComponent(row.projectId)}` : base;
+    }
+    function pvDownloadUrl(row) {
+        return row.downloadUrl || row.videoUrl || '';
+    }
+    function pvDownloadFilename(row) {
+        const raw = (row.name || row.id || 'heygen-video')
+            .replace(/[\\/:*?"<>|]/g, '_')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 120);
+        const id = row.id ? `-${String(row.id).slice(0, 8)}` : '';
+        return `HeyGenVideos/${raw || 'heygen-video'}${id}.mp4`;
+    }
+    function pvDownloadVideo(row) {
+        const url = pvDownloadUrl(row);
+        if (!url) {
+            showToast('这个视频暂时没有下载链接，可能还在生成中', 'info', 3000);
+            return;
+        }
+        const filename = pvDownloadFilename(row);
+        if (typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) {
+            chrome.runtime.sendMessage({ type: 'hvt_download', url, filename }, (res) => {
+                if (chrome.runtime.lastError || !res?.ok) {
+                    showToast('下载失败: ' + (chrome.runtime.lastError?.message || res?.error || '未知错误'), 'error', 4000);
+                } else {
+                    showToast('已开始下载视频', 'success', 2500);
+                }
+            });
+            return;
+        }
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename.split('/').pop();
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        showToast('已开始下载视频', 'success', 2500);
+    }
+
+    async function pvFetchProjects(space) {
+        const params = pvAppendAll(new URLSearchParams({
+            traverse_deep: 'true',
+            is_trash: 'false',
+            limit: '999',
+        }), 'project_types', PV_PROJECT_TYPES);
+        const data = await heygenApi('/v1/projects?' + params, space.id ? { headers: { 'x-space-id': space.id } } : {});
+        const items = data.items || data.list || data.projects || [];
+        const root = {
+            id: '',
+            name: '根目录',
+            path: '根目录',
+            spaceId: space.id || '',
+            spaceName: space.name || '当前空间',
+        };
+        const projects = items.map(p => ({
+            id: p.id || p.project_id || '',
+            name: p.name || p.title || p.project_name || '未命名文件夹',
+            path: pvNormalizePath(p),
+            spaceId: space.id || '',
+            spaceName: space.name || '当前空间',
+        })).filter(p => p.id);
+        return [root, ...projects];
+    }
+
+    async function pvFetchItemsForProject(space, project) {
+        const rows = [];
+        const seen = new Set();
+        let token = null;
+        for (let page = 0; page < PV_SCAN_MAX_PAGES_PER_FOLDER; page++) {
+            if (pvAbort) break;
+            const params = pvAppendAll(new URLSearchParams({
+                limit: '100',
+                sort_key: 'created_ts',
+                sort_order: 'desc',
+                is_trash: 'false',
+            }), 'item_types', PV_ITEM_TYPES);
+            if (project.id) params.set('project_id', project.id);
+            if (token) params.set('token', token);
+            const data = await heygenApi('/v1/project/items?' + params, space.id ? { headers: { 'x-space-id': space.id } } : {});
+            const items = data.items || data.list || data.projects || [];
+            const fresh = items.filter(item => {
+                const id = pvItemId(item);
+                if (!id || seen.has(id)) return false;
+                seen.add(id);
+                return true;
+            });
+            rows.push(...fresh);
+            token = data.token || data.next_token || data.next_pagination_token || null;
+            if (!token || fresh.length === 0) break;
+            await mvShareSleep(120 + Math.random() * 180);
+        }
+        return rows;
+    }
+
+    async function pvFetchItemsForProjects(space, projects, onProgress) {
+        const allItems = [];
+        let nextIndex = 0;
+        let done = 0;
+        async function worker() {
+            for (;;) {
+                if (pvAbort) break;
+                const idx = nextIndex++;
+                if (idx >= projects.length) break;
+                const p = projects[idx];
+                if (onProgress) onProgress(done + 1, projects.length, p);
+                try {
+                    const items = await pvFetchItemsForProject(space, p);
+                    items.forEach(item => {
+                        item._spaceId = space.id || '';
+                        item._spaceName = space.name || '当前空间';
+                        item._projectId = p.id || '';
+                    });
+                    allItems.push(...items);
+                } catch (e) {
+                    console.warn('[hvt] 读取文件夹视频失败:', p.path, e);
+                } finally {
+                    done++;
+                    if (onProgress) onProgress(done, projects.length, p);
+                }
+            }
+        }
+        const workers = Array.from({ length: Math.min(PV_SCAN_CONCURRENCY, projects.length) }, () => worker());
+        await Promise.all(workers);
+        return allItems;
+    }
+
+    function pvBuildRows(items, projectMap, me, oldLedger) {
+        const nextLedger = {};
+        const rows = [];
+        const seenRows = new Set();
+        for (const item of items) {
+            const owner = pvItemOwner(item);
+            if (me && owner !== me) continue;
+            const videoId = pvItemId(item);
+            if (!videoId) continue;
+            const spaceId = item._spaceId || '';
+            const rowKey = pvLedgerKey(spaceId, videoId);
+            if (seenRows.has(rowKey)) continue;
+            seenRows.add(rowKey);
+            const itemProjectId = pvProjectIdOf(item) || item._projectId || '';
+            const folder = projectMap.get(`${spaceId}::${itemProjectId}`) || projectMap.get(`${spaceId}::`) || {
+                id: itemProjectId,
+                name: itemProjectId ? '未知文件夹' : '根目录',
+                path: itemProjectId ? '未知文件夹' : '根目录',
+                spaceName: item._spaceName || '当前空间',
+            };
+            const key = rowKey;
+            const previous = oldLedger[key];
+            const moved = !!(previous && previous.projectId !== itemProjectId);
+            nextLedger[key] = {
+                projectId: itemProjectId,
+                folderPath: folder.path,
+                name: item.name || item.title || item.video_title || videoId,
+                seenAt: Date.now(),
+            };
+            rows.push({
+                id: videoId,
+                name: item.name || item.title || item.video_title || videoId,
+                status: item.status || item.item_status || item.video_status || '',
+                createdTs: item.created_ts || item.created_at || item.create_time || '',
+                thumbnail: item.thumbnail_url || item.cover_url || item.cover || item.image_url || '',
+                downloadUrl: item.video_download_url || item.download_url || '',
+                videoUrl: item.video_url || '',
+                projectId: itemProjectId,
+                folderName: folder.name,
+                folderPath: folder.path,
+                spaceId,
+                spaceName: folder.spaceName || item._spaceName || '当前空间',
+                owner,
+                moved,
+                movedFrom: previous ? previous.folderPath : '',
+            });
+        }
+        rows.sort((a, b) => {
+            return pvDateMs(b.createdTs) - pvDateMs(a.createdTs);
+        });
+        return { rows, nextLedger };
+    }
+
+    async function pvScan() {
+        if (pvScanning) return;
+        const listEl = document.getElementById('hvt-pv-list');
+        const statusEl = document.getElementById('hvt-pv-status');
+        const scanBtn = document.getElementById('hvt-pv-scan');
+        const stopBtn = document.getElementById('hvt-pv-stop');
+        pvScanning = true;
+        pvAbort = false;
+        pvRows = [];
+        if (scanBtn) scanBtn.disabled = true;
+        if (stopBtn) stopBtn.style.display = 'inline-flex';
+        if (listEl) listEl.innerHTML = '<div class="hvt-pv-empty">扫描中…</div>';
+        try {
+            const me = await expGetMyUsername();
+            if (!me) throw new Error('无法识别当前登录账号，请确认 HeyGen 已登录');
+            await fetchSpaces();
+            const spaces = spacesList.length ? spacesList : [{ id: '', name: '当前空间' }];
+            const projectMap = new Map();
+            const allItems = [];
+            let folderCount = 0;
+            for (const sp of spaces) {
+                if (pvAbort) break;
+                if (statusEl) statusEl.textContent = `读取 ${sp.name || '当前空间'} 文件夹…`;
+                let projects = [];
+                try {
+                    projects = await pvFetchProjects(sp);
+                } catch (e) {
+                    console.warn('[hvt] 读取项目文件夹失败:', sp.name, e);
+                    continue;
+                }
+                projects.forEach(p => projectMap.set(`${p.spaceId || ''}::${p.id || ''}`, p));
+                folderCount += projects.length;
+                const items = await pvFetchItemsForProjects(sp, projects, (done, total) => {
+                    if (statusEl) statusEl.textContent = `扫描 ${sp.name || '当前空间'}：${Math.min(done, total)}/${total} 个文件夹…`;
+                });
+                allItems.push(...items);
+            }
+            const oldLedger = pvReadLedger();
+            const built = pvBuildRows(allItems, projectMap, me, oldLedger);
+            if (!pvAbort) pvWriteLedger(built.nextLedger);
+            pvRows = built.rows;
+            pvLastScanMeta = {
+                scanned: allItems.length,
+                totalMine: pvRows.length,
+                moved: pvRows.filter(r => r.moved).length,
+                folders: folderCount,
+                user: me,
+            };
+            pvRender();
+            if (statusEl) statusEl.textContent = pvAbort
+                ? `已停止：已找到 ${pvRows.length} 个你创建的视频`
+                : `完成：快速扫描 ${folderCount} 个文件夹 / ${allItems.length} 条，找到 ${pvRows.length} 个你创建的视频`;
+            showToast(pvAbort ? '已停止扫描' : `✅ 找到 ${pvRows.length} 个你创建的视频`, pvAbort ? 'info' : 'success', 3000);
+        } catch (e) {
+            if (statusEl) statusEl.textContent = '扫描失败: ' + e.message;
+            if (listEl) listEl.innerHTML = `<div class="hvt-pv-empty" style="color:#dc2626">扫描失败: ${esc(e.message)}</div>`;
+            showToast('扫描失败: ' + e.message, 'error', 4000);
+        } finally {
+            pvScanning = false;
+            if (scanBtn) scanBtn.disabled = false;
+            if (stopBtn) stopBtn.style.display = 'none';
+        }
+    }
+
+    function openProjectVideos() {
+        const overlay = document.getElementById('hvt-pv-overlay');
+        if (!overlay) return;
+        overlay.style.display = 'flex';
+        const q = document.getElementById('hvt-pv-search');
+        if (q) q.focus();
+        if (!pvRows.length && !pvScanning) pvScan();
+        else pvRender();
+    }
+    function closeProjectVideos() {
+        const overlay = document.getElementById('hvt-pv-overlay');
+        if (overlay) overlay.style.display = 'none';
+    }
+
+    function pvRender() {
+        const listEl = document.getElementById('hvt-pv-list');
+        const countEl = document.getElementById('hvt-pv-count');
+        if (!listEl) return;
+        const q = (document.getElementById('hvt-pv-search')?.value || '').trim().toLowerCase();
+        const movedOnly = !!document.getElementById('hvt-pv-moved-only')?.checked;
+        const oldDays = pvAgeDays();
+        let visible = pvRows;
+        if (movedOnly) visible = visible.filter(r => r.moved);
+        if (oldDays) visible = visible.filter(r => pvIsOlderThan(r, oldDays));
+        if (q) {
+            visible = visible.filter(r =>
+                (r.name || '').toLowerCase().includes(q) ||
+                (r.folderPath || '').toLowerCase().includes(q) ||
+                (r.status || '').toLowerCase().includes(q) ||
+                (r.id || '').toLowerCase().includes(q)
+            );
+        }
+        const movedCount = pvRows.filter(r => r.moved).length;
+        if (countEl) {
+            const base = pvLastScanMeta
+                ? `共 ${pvRows.length} 个 · 位置变更 ${movedCount} 个`
+                : '尚未扫描';
+            countEl.textContent = q || movedOnly || oldDays ? `${base} · 显示 ${visible.length} 个` : base;
+        }
+        if (!visible.length) {
+            listEl.innerHTML = `<div class="hvt-pv-empty">${pvRows.length ? '没有匹配的视频' : '还没有扫描结果'}</div>`;
+            return;
+        }
+        listEl.innerHTML = '';
+        const frag = document.createDocumentFragment();
+        visible.forEach(row => {
+            const el = document.createElement('div');
+            el.className = 'hvt-pv-row' + (row.moved ? ' hvt-pv-moved' : '');
+            const thumb = row.thumbnail
+                ? `<img class="hvt-pv-thumb" src="${esc(row.thumbnail)}" alt="">`
+                : '<div class="hvt-pv-thumb hvt-pv-thumb-empty">VID</div>';
+            const hasDownload = !!pvDownloadUrl(row);
+            el.innerHTML = `
+                ${thumb}
+                <div class="hvt-pv-main">
+                  <div class="hvt-pv-name" title="${esc(row.name)}">${esc(row.name)}</div>
+                  <div class="hvt-pv-meta">
+                    <span title="团队空间">${esc(row.spaceName)}</span>
+                    <span title="${esc(row.folderPath)}">${esc(row.folderPath)}</span>
+                    <span>${esc(pvFormatDate(row.createdTs))}</span>
+                    ${row.status ? `<span>${esc(row.status)}</span>` : ''}
+                  </div>
+                  ${row.moved ? `<div class="hvt-pv-move-note">位置变更：从「${esc(row.movedFrom || '未知位置')}」到了「${esc(row.folderPath)}」</div>` : ''}
+                </div>
+                <div class="hvt-pv-actions">
+                  <button class="hvt-btn hvt-pv-download" title="${hasDownload ? '下载这个视频 MP4' : '暂时没有下载链接'}" ${hasDownload ? '' : 'disabled'}>下载</button>
+                  <button class="hvt-btn hvt-pv-open" title="打开这个视频所在文件夹">打开文件夹</button>
+                  <button class="hvt-btn hvt-pv-copy-loc" title="复制所在文件夹路径">复制位置</button>
+                  <button class="hvt-btn hvt-pv-copy" title="复制 Video ID">复制ID</button>
+                </div>
+            `;
+            el.querySelector('.hvt-pv-download').addEventListener('click', () => pvDownloadVideo(row));
+            el.querySelector('.hvt-pv-open').addEventListener('click', () => window.open(pvFolderUrl(row), '_blank'));
+            el.querySelector('.hvt-pv-copy-loc').addEventListener('click', async (e) => {
+                try {
+                    await navigator.clipboard.writeText(`${row.spaceName} / ${row.folderPath}`);
+                    const btn = e.currentTarget;
+                    const old = btn.textContent;
+                    btn.textContent = '已复制';
+                    setTimeout(() => { btn.textContent = old; }, 1200);
+                } catch { showToast('复制失败', 'error'); }
+            });
+            el.querySelector('.hvt-pv-copy').addEventListener('click', async (e) => {
+                try {
+                    await navigator.clipboard.writeText(row.id);
+                    const btn = e.currentTarget;
+                    const old = btn.textContent;
+                    btn.textContent = '已复制';
+                    setTimeout(() => { btn.textContent = old; }, 1200);
+                } catch { showToast('复制失败', 'error'); }
+            });
+            frag.appendChild(el);
+        });
+        listEl.appendChild(frag);
+    }
+
     // ─── AI Studio Quick Voice Switch ────────────────────────────────────────
     let aisSearchResults = [];
     let aisFallbackToken = 0; // incremented to cancel an in-flight fallback search
@@ -2600,7 +3031,7 @@
     const CONFIRM_TEXT_RE = /save changes|set default|保存更改|儲存更改|设为默认|設為預設/i;
 
     const elHasAnyIcon = (el, ids) => ids.some(id => el.querySelector(`svg use[href="${id}"]`));
-    const isHvtUI = (el) => !!(el.closest('#hvt-root') || el.closest('#hvt-fab-strip') || el.closest('#hvt-ais-overlay'));
+    const isHvtUI = (el) => !!(el.closest('#hvt-root') || el.closest('#hvt-fab-strip') || el.closest('#hvt-ais-overlay') || el.closest('#hvt-pv-overlay'));
     // a "switch voice" control: matched by icon first, text fallback second
     const isSwitchEl = (el) => !isHvtUI(el) && (elHasAnyIcon(el, SWITCH_ICON_SET) || SWITCH_TEXT_RE.test(el.textContent || ''));
     // the modal's apply/confirm button: the primary-styled button carrying text
@@ -2961,11 +3392,23 @@
                 </svg>
             </button>
             <div class="hvt-fab-divider"></div>
+            <button id="hvt-fab-video" title="找我的视频：跨文件夹定位你创建的视频">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 6h5l2 2h9v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z"/>
+                    <circle cx="11" cy="14" r="3"/>
+                    <path d="m14 17 3 3"/>
+                </svg>
+            </button>
+            <div class="hvt-fab-divider"></div>
             <button id="hvt-fab-vd" title="生音 — AI 声音设计">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/>
                     <path d="M20 3v4m2-2h-4"/>
                 </svg>
+            </button>
+            <div class="hvt-fab-divider"></div>
+            <button id="hvt-fab-eng" title="强制 Avatar III 引擎：Avatar IV / V 自动切回 III">
+                <span class="hvt-fab-eng-txt">III</span>
             </button>
         `;
         document.body.appendChild(fabStrip);
@@ -3153,6 +3596,42 @@
         `;
         document.body.appendChild(mvRoot);
 
+        // Project Videos modal
+        const pvRoot = document.createElement('div');
+        pvRoot.id = 'hvt-pv-overlay';
+        pvRoot.style.display = 'none';
+        pvRoot.innerHTML = `
+            <div id="hvt-pv-panel">
+              <div id="hvt-pv-header">
+                <span id="hvt-pv-title">找我的视频</span>
+                <div id="hvt-pv-header-actions">
+                  <span id="hvt-pv-count"></span>
+                  <button id="hvt-pv-scan" class="hvt-btn">重新扫描</button>
+                  <button id="hvt-pv-stop" class="hvt-btn" style="display:none">停止</button>
+                  <button id="hvt-pv-close" title="关闭">✕</button>
+                </div>
+              </div>
+              <div id="hvt-pv-toolbar">
+                <input id="hvt-pv-search" class="hvt-input" placeholder="搜索视频名称 / 文件夹 / 状态 / ID…" autocomplete="off">
+                <select id="hvt-pv-age" class="hvt-input" title="按创建时间筛选老视频">
+                  <option value="0">全部时间</option>
+                  <option value="3">3天前</option>
+                  <option value="7">7天前</option>
+                  <option value="15">15天前</option>
+                  <option value="custom">自定义</option>
+                </select>
+                <input id="hvt-pv-age-custom" class="hvt-input" type="number" min="1" step="1" placeholder="天数" title="输入自定义天数" style="display:none">
+                <label id="hvt-pv-moved-label">
+                  <input type="checkbox" id="hvt-pv-moved-only">
+                  只看位置变更
+                </label>
+              </div>
+              <div id="hvt-pv-status"></div>
+              <div id="hvt-pv-list"></div>
+            </div>
+        `;
+        document.body.appendChild(pvRoot);
+
         // Share Voice modal (batch email)
         const shareRoot = document.createElement('div');
         shareRoot.id = 'hvt-mv-share-overlay';
@@ -3335,8 +3814,22 @@
             openAisPanel();
         });
 
+        document.getElementById('hvt-fab-video').addEventListener('click', () => {
+            openProjectVideos();
+        });
+
         document.getElementById('hvt-fab-vd').addEventListener('click', () => {
             openVoiceDesign();
+        });
+
+        const engBtn = document.getElementById('hvt-fab-eng');
+        engBtn.classList.toggle('hvt-fab-off', !forceIIIEnabled());
+        engBtn.addEventListener('click', () => {
+            const on = !forceIIIEnabled();
+            localStorage.setItem(FORCE_III_KEY, on ? '1' : '0');
+            engBtn.classList.toggle('hvt-fab-off', !on);
+            showToast(on ? '已开启：Avatar IV / V 将自动切回 III' : '已关闭：不再自动切换引擎', on ? 'success' : 'info', 2000);
+            if (on) enforceAvatarIII();
         });
 
         document.getElementById('hvt-close').addEventListener('click', () => {
@@ -3653,6 +4146,27 @@
             if (e.target === document.getElementById('hvt-mv-overlay')) closeMyVoices();
         });
 
+        // Project Videos modal
+        document.getElementById('hvt-pv-close').addEventListener('click', closeProjectVideos);
+        document.getElementById('hvt-pv-overlay').addEventListener('click', (e) => {
+            if (e.target === document.getElementById('hvt-pv-overlay')) closeProjectVideos();
+        });
+        document.getElementById('hvt-pv-scan').addEventListener('click', pvScan);
+        document.getElementById('hvt-pv-stop').addEventListener('click', () => {
+            pvAbort = true;
+            if (mvShareWaitCancel) mvShareWaitCancel();
+        });
+        document.getElementById('hvt-pv-search').addEventListener('input', debounce(pvRender, 180));
+        document.getElementById('hvt-pv-search').addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeProjectVideos();
+        });
+        document.getElementById('hvt-pv-age').addEventListener('change', () => {
+            pvUpdateAgeCustomVisibility();
+            pvRender();
+        });
+        document.getElementById('hvt-pv-age-custom').addEventListener('input', debounce(pvRender, 180));
+        document.getElementById('hvt-pv-moved-only').addEventListener('change', pvRender);
+
         // Share Voice modal
         document.getElementById('hvt-mv-share-close').addEventListener('click', mvCloseShare);
         document.getElementById('hvt-mv-share-go').addEventListener('click', mvShareGo);
@@ -3737,11 +4251,122 @@
     }
 
     // ─── Init ─────────────────────────────────────────────────────────────────
+    // ─── 强制 Avatar III 引擎（Avatar IV / Avatar V → Avatar III）─────────────
+    // 在 Avatar Shots (/avatar/) 与 AI Studio (/create-v4/) 页面，当"动作引擎"
+    // 为 Avatar IV 或 Avatar V 时自动切回 Avatar III。引擎按钮结构（真实 DOM 确认）：
+    // <button> 可见文本仅为 "Avatar <罗马数字>"（AI Studio 因 img[alt]+文本会
+    // 重复成 "Avatar III Avatar III"），尾部带 chevron。点击后弹出下拉，III 选项
+    // 文本含 "Avatar III"。下拉结构运行时自适应：广选择器 + 文本匹配定位选项。
+    const FORCE_III_KEY   = 'hvt_force_avatar_iii';   // '1' 开启(默认) / '0' 关闭
+    const ENGINE_EXACT_RE = /^(?:Avatar\s+(?:II|III|IV|V)\s*)+$/i; // 纯引擎名（排除"最近创作"等长文本）
+    const AVATAR_IV_RE    = /\bAvatar\s+IV\b/i;
+    const AVATAR_V_RE     = /\bAvatar\s+V\b/i;   // "Avatar IV" 不会误命中（IV 内 V 前无词边界）
+    const AVATAR_III_RE   = /\bAvatar\s+III\b/i;
+
+    let engineSwitching   = false;  // 再入保护：切换期间暂停 observer 触发
+    let engineDebounce    = null;
+    let engineAttempts    = 0;      // 连续失败计数（防死循环）
+    let engineCooldownUntil = 0;    // 失败后的退避截止时间
+
+    const forceIIIEnabled = () => localStorage.getItem(FORCE_III_KEY) !== '0';
+    const onEnginePage    = () => location.pathname.includes('/avatar/') || location.pathname.includes('/create-v4/');
+
+    // 引擎选择器是 Radix DropdownMenu：触发器在 pointerdown 打开，菜单项也按指针事件选中。
+    // 真实页面验证：单纯 el.click() 不会打开菜单，必须补 pointerdown/pointerup。
+    function pointerClick(el) {
+        const fire = (type) => el.dispatchEvent(new PointerEvent(type, {
+            bubbles: true, cancelable: true, pointerType: 'mouse', button: 0,
+            buttons: type === 'pointerdown' ? 1 : 0,
+        }));
+        fire('pointerdown'); fire('pointerup'); el.click();
+    }
+
+    // 定位需要降级的引擎按钮：当前为 Avatar IV 或 Avatar V（AI Studio 多场景时逐个处理）
+    function findDowngradeButton() {
+        return [...document.querySelectorAll('button')].find(b => {
+            if (isHvtUI(b)) return false;
+            const t = (b.textContent || '').trim().replace(/\s+/g, ' ');
+            return ENGINE_EXACT_RE.test(t) && (AVATAR_IV_RE.test(t) || AVATAR_V_RE.test(t));
+        });
+    }
+
+    // 点击引擎按钮后，等待含 Avatar III/IV 文本的下拉弹层出现
+    function waitForEnginePopup(timeout = 1500) {
+        const sel = '[role="menu"],[role="listbox"],[data-radix-popper-content-wrapper],[role="dialog"][data-state="open"]';
+        return new Promise(resolve => {
+            const t0 = Date.now();
+            (function poll() {
+                const p = [...document.querySelectorAll(sel)]
+                    .filter(el => !isHvtUI(el))
+                    .find(el => AVATAR_III_RE.test(el.textContent || '') || AVATAR_IV_RE.test(el.textContent || ''));
+                if (p) return resolve(p);
+                if (Date.now() - t0 > timeout) return resolve(null);
+                setTimeout(poll, 100);
+            })();
+        });
+    }
+
+    async function enforceAvatarIII() {
+        if (!forceIIIEnabled() || !onEnginePage() || engineSwitching) return;
+        const btn = findDowngradeButton();
+        if (!btn) { engineAttempts = 0; return; }              // 无需处理时重置失败计数
+        if (Date.now() < engineCooldownUntil || engineAttempts >= 5) return;
+
+        engineSwitching = true;
+        try {
+            pointerClick(btn);                                 // Radix 菜单需 pointerdown 才会打开
+            const popup = await waitForEnginePopup();
+            if (!popup) {
+                engineAttempts++; engineCooldownUntil = Date.now() + 3000;
+                console.warn('[hvt] 引擎下拉未出现，跳过（第 ' + engineAttempts + ' 次）');
+                return;
+            }
+            const opt = [...popup.querySelectorAll('[role="menuitem"],[role="option"],[role="menuitemradio"],[data-radix-collection-item],button,li,a')]
+                .filter(el => !isHvtUI(el))
+                .find(el => {
+                    const t = (el.textContent || '').replace(/\s+/g, ' ');
+                    return AVATAR_III_RE.test(t) && !AVATAR_IV_RE.test(t);
+                });
+            if (!opt) {
+                engineAttempts++; engineCooldownUntil = Date.now() + 3000;
+                console.warn('[hvt] 下拉中未找到 Avatar III 选项（第 ' + engineAttempts + ' 次）');
+                document.body.click();                          // 关闭下拉，避免卡住
+                return;
+            }
+            pointerClick(opt);
+            await new Promise(r => setTimeout(r, 500));
+            if (findDowngradeButton()) {                        // 校验：仍为 IV/V → 记失败并退避
+                engineAttempts++; engineCooldownUntil = Date.now() + 3000;
+                console.warn('[hvt] 点击后仍为 Avatar IV/V（第 ' + engineAttempts + ' 次），可能存在确认步骤');
+            } else {
+                engineAttempts = 0;
+                console.log('[hvt] 动作引擎已从 Avatar IV/V 自动切回 Avatar III');
+                showToast('已自动将引擎切回 Avatar III', 'success', 2000);
+            }
+        } finally {
+            setTimeout(() => { engineSwitching = false; }, 300);
+        }
+    }
+
+    function initEngineForce() {
+        const tick = () => {
+            clearTimeout(engineDebounce);
+            engineDebounce = setTimeout(enforceAvatarIII, 300);
+        };
+        const obs = new MutationObserver(() => {
+            if (!onEnginePage() || engineSwitching) return;
+            tick();
+        });
+        obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+        tick();  // 初次：覆盖"页面加载即为 Avatar IV"的情况
+    }
+
     function init() {
         loadDb();
         buildUI();
         initUpdateCheck();                 // 检查 GitHub 是否有新版本并提示升级
         spaceInit();                       // 加载社区声音缓存并后台慢速刷新
+        initEngineForce();                 // Avatar IV 自动切回 Avatar III
         setTimeout(expAutoCleanRun, 8000); // 若已开启自动清理，加载后在后台执行
     }
 
