@@ -230,6 +230,8 @@
     let pvScanning = false;
     let pvAbort = false;
     let pvLastScanMeta = null;       // { scanned, totalMine, moved }
+    let pvSelected = new Set();      // 勾选待移入回收站的行 key（spaceId::videoId）
+    let pvTrashRunning = false;      // 批量移入回收站进行中
 
     // ─── Storage ──────────────────────────────────────────────────────────────
     function loadDb() {
@@ -2828,6 +2830,7 @@
             };
             rows.push({
                 id: videoId,
+                itemType: item.item_type || item.type || 'heygen_video',
                 name: item.name || item.title || item.video_title || videoId,
                 status: item.status || item.item_status || item.video_status || '',
                 createdTs: item.created_ts || item.created_at || item.create_time || '',
@@ -2859,6 +2862,7 @@
         pvScanning = true;
         pvAbort = false;
         pvRows = [];
+        pvSelected.clear();
         if (scanBtn) scanBtn.disabled = true;
         if (stopBtn) stopBtn.style.display = 'inline-flex';
         if (listEl) listEl.innerHTML = '<div class="hvt-pv-empty">扫描中…</div>';
@@ -2928,10 +2932,7 @@
         if (overlay) overlay.style.display = 'none';
     }
 
-    function pvRender() {
-        const listEl = document.getElementById('hvt-pv-list');
-        const countEl = document.getElementById('hvt-pv-count');
-        if (!listEl) return;
+    function pvVisibleRows() {
         const q = (document.getElementById('hvt-pv-search')?.value || '').trim().toLowerCase();
         const movedOnly = !!document.getElementById('hvt-pv-moved-only')?.checked;
         const oldDays = pvAgeDays();
@@ -2946,6 +2947,37 @@
                 (r.id || '').toLowerCase().includes(q)
             );
         }
+        return visible;
+    }
+
+    // 同步「全选」勾选态和「移入回收站」按钮的数量/可用性
+    function pvSyncSelectionUI(visible) {
+        visible = visible || pvVisibleRows();
+        const selAll = document.getElementById('hvt-pv-selall');
+        const trashBtn = document.getElementById('hvt-pv-trash');
+        if (selAll) {
+            const visKeys = visible.map(r => pvLedgerKey(r.spaceId, r.id));
+            const checkedCount = visKeys.filter(k => pvSelected.has(k)).length;
+            selAll.checked = visible.length > 0 && checkedCount === visible.length;
+            selAll.indeterminate = checkedCount > 0 && checkedCount < visible.length;
+        }
+        if (trashBtn && !pvTrashRunning) {
+            trashBtn.textContent = pvSelected.size ? `移入回收站 (${pvSelected.size})` : '移入回收站';
+            trashBtn.disabled = pvSelected.size === 0;
+        }
+    }
+
+    function pvRender() {
+        const listEl = document.getElementById('hvt-pv-list');
+        const countEl = document.getElementById('hvt-pv-count');
+        if (!listEl) return;
+        const q = (document.getElementById('hvt-pv-search')?.value || '').trim().toLowerCase();
+        const movedOnly = !!document.getElementById('hvt-pv-moved-only')?.checked;
+        const oldDays = pvAgeDays();
+        const visible = pvVisibleRows();
+        // 清掉已不存在于结果中的勾选（重扫/删除后）
+        const validKeys = new Set(pvRows.map(r => pvLedgerKey(r.spaceId, r.id)));
+        pvSelected.forEach(k => { if (!validKeys.has(k)) pvSelected.delete(k); });
         const movedCount = pvRows.filter(r => r.moved).length;
         if (countEl) {
             const base = pvLastScanMeta
@@ -2955,6 +2987,7 @@
         }
         if (!visible.length) {
             listEl.innerHTML = `<div class="hvt-pv-empty">${pvRows.length ? '没有匹配的视频' : '还没有扫描结果'}</div>`;
+            pvSyncSelectionUI(visible);
             return;
         }
         listEl.innerHTML = '';
@@ -2962,11 +2995,13 @@
         visible.forEach(row => {
             const el = document.createElement('div');
             el.className = 'hvt-pv-row' + (row.moved ? ' hvt-pv-moved' : '');
+            const rowKey = pvLedgerKey(row.spaceId, row.id);
             const thumb = row.thumbnail
                 ? `<img class="hvt-pv-thumb" src="${esc(row.thumbnail)}" alt="">`
                 : '<div class="hvt-pv-thumb hvt-pv-thumb-empty">VID</div>';
             const hasDownload = !!pvDownloadUrl(row);
             el.innerHTML = `
+                <input type="checkbox" class="hvt-pv-check" title="勾选后可批量移入回收站" ${pvSelected.has(rowKey) ? 'checked' : ''}>
                 ${thumb}
                 <div class="hvt-pv-main">
                   <div class="hvt-pv-name" title="${esc(row.name)}">${esc(row.name)}</div>
@@ -2985,6 +3020,11 @@
                   <button class="hvt-btn hvt-pv-copy" title="复制 Video ID">复制ID</button>
                 </div>
             `;
+            el.querySelector('.hvt-pv-check').addEventListener('change', (e) => {
+                if (e.currentTarget.checked) pvSelected.add(rowKey);
+                else pvSelected.delete(rowKey);
+                pvSyncSelectionUI();
+            });
             el.querySelector('.hvt-pv-download').addEventListener('click', () => pvDownloadVideo(row));
             el.querySelector('.hvt-pv-open').addEventListener('click', () => window.open(pvFolderUrl(row), '_blank'));
             el.querySelector('.hvt-pv-copy-loc').addEventListener('click', async (e) => {
@@ -3008,6 +3048,66 @@
             frag.appendChild(el);
         });
         listEl.appendChild(frag);
+        pvSyncSelectionUI(visible);
+    }
+
+    // 批量移入回收站：接口原生支持批量（items 数组），按 spaceId 分组、每组一次请求。
+    // Endpoint: DELETE /v1/project/item.trash  body {items:[{id,item_type}]} + x-space-id
+    // 语义是移入回收站（可在 HeyGen 回收站恢复），非永久删除。
+    const PV_TRASH_CHUNK = 50;
+    async function pvTrashSelected() {
+        if (pvTrashRunning || pvScanning) return;
+        const targets = pvRows.filter(r => pvSelected.has(pvLedgerKey(r.spaceId, r.id)));
+        if (!targets.length) return;
+
+        const preview = targets.slice(0, 8).map(r => `· ${r.name}`).join('\n');
+        const more = targets.length > 8 ? `\n· … 等共 ${targets.length} 个` : '';
+        if (!confirm(`把选中的 ${targets.length} 个你创建的视频移入回收站？\n（可在 HeyGen 回收站中恢复）\n\n${preview}${more}`)) return;
+
+        const trashBtn = document.getElementById('hvt-pv-trash');
+        const statusEl = document.getElementById('hvt-pv-status');
+        pvTrashRunning = true;
+        if (trashBtn) { trashBtn.disabled = true; trashBtn.textContent = '移入回收站中…'; }
+
+        const bySpace = new Map();
+        targets.forEach(r => {
+            const list = bySpace.get(r.spaceId) || [];
+            list.push(r);
+            bySpace.set(r.spaceId, list);
+        });
+
+        let ok = 0, failed = 0;
+        for (const [spaceId, rows] of bySpace) {
+            for (let i = 0; i < rows.length; i += PV_TRASH_CHUNK) {
+                const chunk = rows.slice(i, i + PV_TRASH_CHUNK);
+                if (statusEl) statusEl.textContent = `移入回收站：${ok + failed + chunk.length}/${targets.length}…`;
+                try {
+                    await heygenApi('/v1/project/item.trash', {
+                        method: 'DELETE',
+                        headers: spaceId ? { 'x-space-id': spaceId } : {},
+                        body: JSON.stringify({ items: chunk.map(r => ({ id: r.id, item_type: r.itemType || 'heygen_video' })) }),
+                    });
+                    ok += chunk.length;
+                    const doneKeys = new Set(chunk.map(r => pvLedgerKey(r.spaceId, r.id)));
+                    pvRows = pvRows.filter(r => !doneKeys.has(pvLedgerKey(r.spaceId, r.id)));
+                    doneKeys.forEach(k => pvSelected.delete(k));
+                    const ledger = pvReadLedger();
+                    doneKeys.forEach(k => delete ledger[k]);
+                    pvWriteLedger(ledger);
+                } catch (e) {
+                    failed += chunk.length;
+                    console.warn('[hvt] 移入回收站失败:', spaceId, e);
+                }
+                await mvShareSleep(300 + Math.random() * 300);
+            }
+        }
+
+        pvTrashRunning = false;
+        pvRender();
+        if (statusEl) statusEl.textContent = failed
+            ? `移入回收站：成功 ${ok} 个，失败 ${failed} 个`
+            : `已把 ${ok} 个视频移入回收站（可在 HeyGen 回收站恢复）`;
+        showToast(failed ? `移入回收站：成功 ${ok}，失败 ${failed}` : `✅ 已移入回收站 ${ok} 个视频`, failed ? 'error' : 'success', 4000);
     }
 
     // ─── AI Studio Quick Voice Switch ────────────────────────────────────────
@@ -3625,6 +3725,11 @@
                   <input type="checkbox" id="hvt-pv-moved-only">
                   只看位置变更
                 </label>
+                <label id="hvt-pv-selall-label" title="全选当前筛选出来的视频">
+                  <input type="checkbox" id="hvt-pv-selall">
+                  全选
+                </label>
+                <button id="hvt-pv-trash" class="hvt-btn hvt-btn-danger" disabled>移入回收站</button>
               </div>
               <div id="hvt-pv-status"></div>
               <div id="hvt-pv-list"></div>
@@ -4166,6 +4271,13 @@
         });
         document.getElementById('hvt-pv-age-custom').addEventListener('input', debounce(pvRender, 180));
         document.getElementById('hvt-pv-moved-only').addEventListener('change', pvRender);
+        document.getElementById('hvt-pv-selall').addEventListener('change', (e) => {
+            const visible = pvVisibleRows();
+            if (e.currentTarget.checked) visible.forEach(r => pvSelected.add(pvLedgerKey(r.spaceId, r.id)));
+            else visible.forEach(r => pvSelected.delete(pvLedgerKey(r.spaceId, r.id)));
+            pvRender();
+        });
+        document.getElementById('hvt-pv-trash').addEventListener('click', pvTrashSelected);
 
         // Share Voice modal
         document.getElementById('hvt-mv-share-close').addEventListener('click', mvCloseShare);
