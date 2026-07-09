@@ -3479,10 +3479,22 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         return null;
     }
 
+    function aisTargetVoiceObj(targetVoiceId) {
+        return mvVoices.find(v => v.voice_id === targetVoiceId) || spaceVoices.find(v => v.voice_id === targetVoiceId) || db.voices[targetVoiceId] || null;
+    }
+
+    function aisCurrentVoiceDialog() {
+        return [...document.querySelectorAll('[role="dialog"][data-state="open"]')]
+            .find(d => !isHvtUI(d) && (
+                d.querySelector('svg use[href="#play-s"]') ||
+                /select voice|avatar voice|选择音色|選擇音色|的声音|的語音|的语音/i.test(d.textContent)
+            )) || null;
+    }
+
     // aisBridgeSwitch: asks ais-bridge.js (MAIN world) to call onSelect via CustomEvent.
     // Passes full voiceObj so bridge can switch even if the voice isn't rendered in the modal.
-    function aisBridgeSwitch(targetVoiceId) {
-        const voiceObj = mvVoices.find(v => v.voice_id === targetVoiceId) || spaceVoices.find(v => v.voice_id === targetVoiceId) || db.voices[targetVoiceId] || null;
+    function aisBridgeSwitch(targetVoiceId, opts = {}) {
+        const voiceObj = aisTargetVoiceObj(targetVoiceId);
         return new Promise((resolve) => {
             const handler = (e) => {
                 document.removeEventListener('hvt-ais-result', handler);
@@ -3494,8 +3506,73 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 resolve({ success: false });
             }, 5000);
             document.addEventListener('hvt-ais-result', handler);
-            document.dispatchEvent(new CustomEvent('hvt-ais-switch', { detail: { id: targetVoiceId, voiceObj } }));
+            document.dispatchEvent(new CustomEvent('hvt-ais-switch', { detail: { id: targetVoiceId, voiceObj, visibleOnly: !!opts.visibleOnly } }));
         });
+    }
+
+    async function aisBridgeSwitchUntil(targetVoiceId, opts = {}, timeoutMs = 2500) {
+        const start = Date.now();
+        let last = { success: false };
+        do {
+            last = await aisBridgeSwitch(targetVoiceId, opts);
+            if (last.success) return last;
+            await new Promise(r => setTimeout(r, 250));
+        } while (Date.now() - start < timeoutMs);
+        return last;
+    }
+
+    function aisSetInputValue(input, value) {
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        if (setter) setter.call(input, value);
+        else input.value = value;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    async function aisSearchOpenModal(targetVoiceId, opts) {
+        const dialog = aisCurrentVoiceDialog();
+        if (!dialog) return { success: false };
+        const input = [...dialog.querySelectorAll('input')]
+            .find(el => !isHvtUI(el) && !el.disabled && (!el.type || ['text', 'search'].includes(el.type)));
+        if (!input) return { success: false };
+
+        const voiceObj = aisTargetVoiceObj(targetVoiceId);
+        const terms = [voiceObj && voiceObj.display_name, voiceObj && voiceObj.name, targetVoiceId]
+            .filter(Boolean)
+            .map(t => String(t).trim())
+            .filter(Boolean);
+        const original = input.value || '';
+        for (const term of [...new Set(terms)]) {
+            aisSetInputValue(input, term);
+            await new Promise(r => setTimeout(r, 900));
+            const result = await aisBridgeSwitchUntil(targetVoiceId, opts, 2500);
+            if (result.success) return result;
+        }
+        aisSetInputValue(input, original);
+        await new Promise(r => setTimeout(r, 300));
+        return { success: false };
+    }
+
+    function aisFindSeeMoreBtn() {
+        const dialog = aisCurrentVoiceDialog();
+        if (!dialog) return null;
+        const textRe = /^(see more(?:\s*\(\d+\))?|查看更多(?:\s*\(\d+\))?|顯示更多(?:\s*\(\d+\))?)$/i;
+        return [...dialog.querySelectorAll('button,[role="button"],[tabindex],div')]
+            .filter(el => !isHvtUI(el) && !el.closest('button[disabled]') && el.offsetParent !== null)
+            .find(el => textRe.test((el.textContent || '').trim().replace(/\s+/g, ' '))) || null;
+    }
+
+    async function aisExpandOpenModalUntilFound(targetVoiceId, opts) {
+        let last = { success: false };
+        for (;;) {
+            const moreBtn = aisFindSeeMoreBtn();
+            if (!moreBtn) break;
+            moreBtn.click();
+            await new Promise(r => setTimeout(r, 900));
+            last = await aisBridgeSwitchUntil(targetVoiceId, opts, 2500);
+            if (last.success) return last;
+        }
+        return last;
     }
 
     async function aisQuickSwitch(targetVoiceId) {
@@ -3580,8 +3657,14 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
 
         setStatus('正在切换声音…');
 
+        // Avatar Shots needs a real modal row selection. A cached voice object can
+        // return without error while leaving the original voice selected.
+        const bridgeOpts = isAvatarShots ? { visibleOnly: true } : {};
+
         // Try current (first) tab — bridge handles modal search internally if needed
-        let result = await aisBridgeSwitch(targetVoiceId);
+        let result = await aisBridgeSwitchUntil(targetVoiceId, bridgeOpts, isAvatarShots ? 2000 : 500);
+        if (!result.success && isAvatarShots) result = await aisSearchOpenModal(targetVoiceId, bridgeOpts);
+        if (!result.success && isAvatarShots) result = await aisExpandOpenModalUntilFound(targetVoiceId, bridgeOpts);
 
         // If not found, iterate the modal's tabs (我的语音 / HeyGen 库 / …).
         // Tabs carry role="tab" (language-independent), so iterate them all.
@@ -3592,7 +3675,9 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 if (tab.getAttribute('aria-selected') === 'true') continue;
                 tab.click();
                 await new Promise(r => setTimeout(r, 600));
-                result = await aisBridgeSwitch(targetVoiceId);
+                result = await aisBridgeSwitchUntil(targetVoiceId, bridgeOpts, isAvatarShots ? 3000 : 500);
+                if (!result.success && isAvatarShots) result = await aisSearchOpenModal(targetVoiceId, bridgeOpts);
+                if (!result.success && isAvatarShots) result = await aisExpandOpenModalUntilFound(targetVoiceId, bridgeOpts);
                 if (result.success) break;
             }
         }
@@ -3609,7 +3694,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             setStatus(`✅ 已切换到「${result.name}」`, 'success');
             showToast(`✅ 已切换到「${result.name}」`, 'success', 2500);
         } else {
-            setStatus('未找到该声音（已搜索全部标签）', 'error');
+            setStatus(isAvatarShots ? '未在弹窗列表/搜索/分页中找到该声音，请确认 My voices 可搜索到它' : '未找到该声音（已搜索全部标签）', 'error');
         }
     }
 
@@ -4287,12 +4372,11 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
 
         const engBtn = document.getElementById('hvt-fab-eng');
         engBtn.classList.toggle('hvt-fab-off', !forceIIIEnabled());
-        engBtn.addEventListener('click', () => {
-            const on = !forceIIIEnabled();
-            localStorage.setItem(FORCE_III_KEY, on ? '1' : '0');
-            engBtn.classList.toggle('hvt-fab-off', !on);
-            showToast(on ? '已开启：Avatar IV / V 将自动切回 III' : '已关闭：不再自动切换引擎', on ? 'success' : 'info', 2000);
-            if (on) enforceAvatarIII();
+        engBtn.addEventListener('click', async () => {
+            localStorage.setItem(FORCE_III_KEY, '1');
+            engBtn.classList.remove('hvt-fab-off');
+            showToast('正在切换到 Avatar III…', 'info', 1600);
+            await enforceAvatarIII(true);
         });
 
         document.getElementById('hvt-close').addEventListener('click', () => {
@@ -4798,15 +4882,22 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         });
     }
 
-    // 点击引擎按钮后，等待含 Avatar III/IV 文本的下拉弹层出现
-    function waitForEnginePopup(timeout = 1500) {
-        const sel = '[role="menu"],[role="listbox"],[data-radix-popper-content-wrapper],[role="dialog"][data-state="open"]';
+    function findEnginePopup() {
+        const sel = '[role="menu"],[role="listbox"],[data-radix-popper-content-wrapper],[role="dialog"][data-state="open"],[data-radix-menu-content],body > div';
+        const candidates = [...document.querySelectorAll(sel)]
+            .filter(el => !isHvtUI(el) && el.offsetParent !== null)
+            .map(el => ({ el, text: (el.textContent || '').replace(/\s+/g, ' ').trim() }))
+            .filter(x => AVATAR_III_RE.test(x.text) && (AVATAR_IV_RE.test(x.text) || AVATAR_V_RE.test(x.text)))
+            .sort((a, b) => a.text.length - b.text.length);
+        return candidates[0]?.el || null;
+    }
+
+    // 点击引擎按钮后，等待含 Avatar III/IV/V 文本的下拉弹层出现
+    function waitForEnginePopup(timeout = 3500) {
         return new Promise(resolve => {
             const t0 = Date.now();
             (function poll() {
-                const p = [...document.querySelectorAll(sel)]
-                    .filter(el => !isHvtUI(el))
-                    .find(el => AVATAR_III_RE.test(el.textContent || '') || AVATAR_IV_RE.test(el.textContent || ''));
+                const p = findEnginePopup();
                 if (p) return resolve(p);
                 if (Date.now() - t0 > timeout) return resolve(null);
                 setTimeout(poll, 100);
@@ -4814,42 +4905,87 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         });
     }
 
-    async function enforceAvatarIII() {
-        if (!forceIIIEnabled() || !onEnginePage() || engineSwitching) return;
+    function findAvatarIIIOption(popup) {
+        const clickableOption = (el) => {
+            const clickable = el.closest('[role="menuitem"],[role="option"],[role="menuitemradio"],[data-radix-collection-item],button,li,[tabindex]');
+            return clickable && popup.contains(clickable) ? clickable : el;
+        };
+        const candidates = [popup, ...popup.querySelectorAll('[role="menuitem"],[role="option"],[role="menuitemradio"],[data-radix-collection-item],button,li,a,div,span')]
+            .filter(el => !isHvtUI(el) && el.offsetParent !== null)
+            .map(el => ({ el, text: (el.textContent || '').replace(/\s+/g, ' ').trim() }))
+            .filter(x => AVATAR_III_RE.test(x.text) && !AVATAR_IV_RE.test(x.text) && !AVATAR_V_RE.test(x.text))
+            .sort((a, b) => a.text.length - b.text.length);
+        return candidates[0] ? clickableOption(candidates[0].el) : null;
+    }
+
+    function engineBridgeForceIII() {
+        return new Promise(resolve => {
+            const handler = (e) => {
+                document.removeEventListener('hvt-engine-result', handler);
+                clearTimeout(timer);
+                resolve(e.detail || { success: false });
+            };
+            const timer = setTimeout(() => {
+                document.removeEventListener('hvt-engine-result', handler);
+                resolve({ success: false, error: 'timeout' });
+            }, 4000);
+            document.addEventListener('hvt-engine-result', handler);
+            document.dispatchEvent(new CustomEvent('hvt-engine-force-iii'));
+        });
+    }
+
+    async function enforceAvatarIII(manual = false) {
+        if (!forceIIIEnabled() || !onEnginePage() || engineSwitching) return false;
         const btn = findDowngradeButton();
-        if (!btn) { engineAttempts = 0; return; }              // 无需处理时重置失败计数
-        if (Date.now() < engineCooldownUntil || engineAttempts >= 5) return;
+        if (!btn) {
+            engineAttempts = 0;                                // 无需处理时重置失败计数
+            if (manual) showToast('当前已是 Avatar III，或未找到可切换的引擎按钮', 'info', 2200);
+            return false;
+        }
+        if (!manual && (Date.now() < engineCooldownUntil || engineAttempts >= 5)) return false;
+        if (manual) { engineAttempts = 0; engineCooldownUntil = 0; }
 
         engineSwitching = true;
         try {
-            pointerClick(btn);                                 // Radix 菜单需 pointerdown 才会打开
-            const popup = await waitForEnginePopup();
+            const bridgeResult = await engineBridgeForceIII();
+            if (bridgeResult.success || !findDowngradeButton()) {
+                engineAttempts = 0;
+                console.log('[hvt] 动作引擎已通过 MAIN world 切回 Avatar III');
+                showToast('已自动将引擎切回 Avatar III', 'success', 2000);
+                return true;
+            }
+
+            let popup = findEnginePopup();
+            if (!popup) {
+                pointerClick(btn);                             // Radix 菜单需 pointerdown 才会打开
+                popup = await waitForEnginePopup();
+            }
             if (!popup) {
                 engineAttempts++; engineCooldownUntil = Date.now() + 3000;
                 console.warn('[hvt] 引擎下拉未出现，跳过（第 ' + engineAttempts + ' 次）');
-                return;
+                if (manual) showToast('未能打开 Avatar 引擎下拉，请再试一次', 'error', 2500);
+                return false;
             }
-            const opt = [...popup.querySelectorAll('[role="menuitem"],[role="option"],[role="menuitemradio"],[data-radix-collection-item],button,li,a')]
-                .filter(el => !isHvtUI(el))
-                .find(el => {
-                    const t = (el.textContent || '').replace(/\s+/g, ' ');
-                    return AVATAR_III_RE.test(t) && !AVATAR_IV_RE.test(t);
-                });
+            const opt = findAvatarIIIOption(popup);
             if (!opt) {
                 engineAttempts++; engineCooldownUntil = Date.now() + 3000;
                 console.warn('[hvt] 下拉中未找到 Avatar III 选项（第 ' + engineAttempts + ' 次）');
                 document.body.click();                          // 关闭下拉，避免卡住
-                return;
+                if (manual) showToast('下拉中未找到 Avatar III 选项', 'error', 2500);
+                return false;
             }
             pointerClick(opt);
             await new Promise(r => setTimeout(r, 500));
             if (findDowngradeButton()) {                        // 校验：仍为 IV/V → 记失败并退避
                 engineAttempts++; engineCooldownUntil = Date.now() + 3000;
                 console.warn('[hvt] 点击后仍为 Avatar IV/V（第 ' + engineAttempts + ' 次），可能存在确认步骤');
+                if (manual) showToast('点击后仍未切到 Avatar III，请检查是否有确认步骤', 'error', 2800);
+                return false;
             } else {
                 engineAttempts = 0;
                 console.log('[hvt] 动作引擎已从 Avatar IV/V 自动切回 Avatar III');
                 showToast('已自动将引擎切回 Avatar III', 'success', 2000);
+                return true;
             }
         } finally {
             setTimeout(() => { engineSwitching = false; }, 300);
