@@ -123,3 +123,49 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return true; // keep message channel open for async sendResponse
     }
 });
+
+// content.js 请求 Gemini 分析头像图片 → 声音设计提示词。
+// 在 service worker 里 fetch，绕开页面 CSP 限制（generativelanguage 已在 host_permissions）。
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg.type === 'hvt_gemini_generate') {
+        (async () => {
+            try {
+                const { apiKey, model, systemPrompt, images, userNote } = msg;
+                const parts = images.map((img) => ({
+                    inline_data: { mime_type: 'image/jpeg', data: img }
+                }));
+                parts.push({ text: userNote || '请分析图中人物并按格式输出声音设计提示词。' });
+                const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-goog-api-key': apiKey
+                    },
+                    body: JSON.stringify({
+                        system_instruction: { parts: [{ text: systemPrompt }] },
+                        contents: [{ role: 'user', parts }],
+                        generationConfig: { temperature: 0.7 }
+                    })
+                });
+                const data = await res.json().catch(() => null);
+                if (!res.ok) {
+                    const apiMsg = data && data.error && data.error.message;
+                    throw new Error(apiMsg || `HTTP ${res.status}`);
+                }
+                const cand = data && data.candidates && data.candidates[0];
+                const text = cand && cand.content && cand.content.parts
+                    ? cand.content.parts.map((p) => p.text || '').join('')
+                    : '';
+                if (!text) {
+                    const reason = (cand && cand.finishReason) || (data && data.promptFeedback && data.promptFeedback.blockReason);
+                    throw new Error(reason ? `Gemini 未返回内容 (${reason})` : 'Gemini 未返回内容');
+                }
+                sendResponse({ ok: true, text });
+            } catch (e) {
+                sendResponse({ ok: false, error: e.message });
+            }
+        })();
+        return true;
+    }
+});

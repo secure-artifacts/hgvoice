@@ -1125,13 +1125,27 @@ td.hvt-copied { animation: hvt-copy-flash 0.55s ease-out; }
 
 .hvt-mv-name {
     flex: 1;
+    min-width: 0;
     font-size: 14px;
     font-weight: 600;
     color: #1e293b;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    white-space: normal;
+    word-break: break-word;
 }
+
+.hvt-mv-name-copy-btn {
+    flex-shrink: 0;
+    font-size: 12px;
+    line-height: 1;
+    padding: 3px 5px;
+    color: #6366f1;
+    border: 1px solid #c7d2fe;
+    border-radius: 5px;
+    background: #fff;
+    cursor: pointer;
+}
+.hvt-mv-name-copy-btn:hover { background: #eef2ff; }
+.hvt-mv-name-copy-btn.hvt-copied { color: #16a34a; border-color: #86efac; background: #dcfce7; }
 
 .hvt-mv-gender {
     font-size: 13px;
@@ -1846,4 +1860,211 @@ td.hvt-copied { animation: hvt-copy-flash 0.55s ease-out; }
     background: #f8fafc;
     border-top: 1px solid #e2e8f0;
     flex-shrink: 0;
+}
+
+/* ─── Voice Design: 引擎切换（HeyGen / Gemini） ─────────────────────────── */
+#hvt-vd-engine-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+#hvt-vd-engine-tabs {
+    display: flex;
+    gap: 0;
+    border: 1px solid #c4b5fd;
+    border-radius: 7px;
+    overflow: hidden;
+}
+.hvt-vd-engine-tab {
+    background: #fff;
+    border: none;
+    padding: 5px 14px;
+    font-size: 13px;
+    color: #6b7280;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+.hvt-vd-engine-tab + .hvt-vd-engine-tab { border-left: 1px solid #ddd6fe; }
+.hvt-vd-engine-tab.hvt-active {
+    background: #7c3aed;
+    color: #fff;
+    font-weight: 600;
+}
+
+/* Gemini 设置面板 */
+#hvt-gm-settings {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: #faf8ff;
+    border: 1px solid #ddd6fe;
+    border-radius: 10px;
+    padding: 12px 14px;
+}
+.hvt-gm-set-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.hvt-gm-set-row > label {
+    flex: 0 0 110px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #475569;
+}
+.hvt-gm-set-row > input { flex: 1; }
+.hvt-gm-set-col { flex-direction: column; align-items: stretch; gap: 5px; }
+.hvt-gm-set-col > label { flex: none; }
+#hvt-gm-sys { height: 180px; font-size: 12px; }
+.hvt-gm-set-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.hvt-gm-set-actions a {
+    font-size: 12px;
+    color: #7c3aed;
+    margin-right: auto;
+}
+
+/* Gemini 多图上传 */
+#hvt-gm-photo-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+#hvt-gm-thumbs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.hvt-gm-thumb {
+    position: relative;
+    width: 72px;
+    height: 72px;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid #ddd6fe;
+}
+.hvt-gm-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+.hvt-gm-thumb button {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(15,23,42,0.6);
+    color: #fff;
+    font-size: 10px;
+    line-height: 18px;
+    padding: 0;
+    cursor: pointer;
+}
+#hvt-gm-add {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 72px;
+    height: 72px;
+    border: 1px dashed #c4b5fd;
+    border-radius: 8px;
+    background: #faf8ff;
+    color: #8b5cf6;
+    font-size: 12px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+}
+#hvt-gm-add:hover { border-color: #7c3aed; background: #f3efff; }
+#hvt-gm-status { font-size: 12px; line-height: 1.5; }
+#hvt-gm-create-hint { font-size: 12px; color: #8b8abf; }
+
+/* Gemini 结果：完整分析 + 3 个提示词方案卡 */
+#hvt-gm-result {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+#hvt-gm-analysis summary {
+    font-size: 12px;
+    color: #7c3aed;
+    cursor: pointer;
+    user-select: none;
+}
+#hvt-gm-analysis-text {
+    margin: 6px 0 0;
+    padding: 10px 12px;
+    background: #faf8ff;
+    border: 1px solid #ddd6fe;
+    border-radius: 8px;
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 260px;
+    overflow-y: auto;
+    font-family: inherit;
+}
+#hvt-gm-prompts {
+    display: flex;
+    gap: 12px;
+    align-items: stretch;
+}
+.hvt-gm-prompt-card {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: #f5f3ff;
+    border: 1px solid #ddd6fe;
+    border-radius: 10px;
+    padding: 12px;
+}
+.hvt-gm-prompt-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #5b21b6;
+    cursor: pointer;
+}
+.hvt-gm-prompt-text { height: 130px; font-size: 12px; background: #fff; }
+.hvt-gm-fill { align-self: flex-start; }
+
+/* HeyGen 风格补充 */
+#hvt-vd-refine-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+}
+#hvt-vd-refine-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: #475569;
+    cursor: pointer;
+    user-select: none;
+}
+#hvt-vd-refine-text { height: 64px; font-size: 12px; }
+
+/* 分组标签 + 多组声音卡换行（Gemini 多方案时最多 9 张卡） */
+#hvt-vd-options { flex-wrap: wrap; }
+#hvt-vd-options .hvt-vd-card { flex: 1 1 calc(33.33% - 10px); min-width: 280px; }
+.hvt-vd-group-label {
+    flex-basis: 100%;
+    font-size: 13px;
+    font-weight: 700;
+    color: #5b21b6;
+    margin-top: 4px;
 }

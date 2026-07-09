@@ -1,8 +1,8 @@
 {
     "manifest_version": 3,
     "name": "人声筛选工具",
-    "version": "1.10.0",
-    "description": "HeyGen 人声筛选工具 – 声音库筛选、试听、我的声音管理、找我的视频、社区(Space)声音搜索/切换/删除、下载与分享到期清理",
+    "version": "1.11.0",
+    "description": "HeyGen 人声筛选工具 – 声音库筛选、试听、我的声音管理、找我的视频、社区(Space)声音搜索/切换/删除、下载与分享到期清理、头像生成声音(HeyGen/Gemini)",
     "permissions": ["downloads", "storage", "alarms"],
     "background": {
         "service_worker": "background.js"
@@ -11,7 +11,8 @@
         "https://*.heygen.com/*",
         "https://*.heygen.ai/*",
         "https://api2.heygen.com/*",
-        "https://api.github.com/*"
+        "https://api.github.com/*",
+        "https://generativelanguage.googleapis.com/*"
     ],
     "content_scripts": [
         {

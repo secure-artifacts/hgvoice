@@ -1249,13 +1249,92 @@
             .forEach(b => { b.dataset.playing = ''; });
     }
 
+    // 依次为每个提示词调 voice_design/create，返回分组结果（每组通常 3 个声音选项）
+    async function vdCreateVoices(promptItems, statusEl) {
+        const groups = [];
+        for (let i = 0; i < promptItems.length; i++) {
+            const it = promptItems[i];
+            if (statusEl && promptItems.length > 1) {
+                statusEl.textContent = `⏳ 生成中 ${i + 1}/${promptItems.length}（${it.label}）…`;
+            }
+            const data = await heygenApi('/v1/voice/voice_design/create', {
+                method: 'POST',
+                body: JSON.stringify({ name: 'Voice', prompt: it.prompt, prefer_stream: true }),
+            });
+            const { request_id, options } = data;
+            if (options && options.length) groups.push({ label: it.label, request_id, options });
+        }
+        if (!groups.length) throw new Error('未返回声音选项');
+        return groups;
+    }
+
+    function vdRenderOptionGroups(groups) {
+        const optionsEl = document.getElementById('hvt-vd-options');
+        if (vdAudioEl) { vdAudioEl.pause(); vdAudioEl = null; }
+
+        optionsEl.innerHTML = groups.map(g => `
+            ${g.label ? `<div class="hvt-vd-group-label">${esc(g.label)}</div>` : ''}
+            ${g.options.map(opt => `
+                <div class="hvt-vd-card">
+                    <div class="hvt-vd-card-top">
+                        <button class="hvt-vd-preview-btn" data-req="${esc(g.request_id)}" data-opt="${esc(opt.id)}" data-url="${esc(opt.audio_url || '')}" title="试听">
+                            <svg class="ic-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/></svg>
+                            <svg class="ic-stop" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>
+                        </button>
+                        <span class="hvt-vd-opt-name" title="点击改名">${esc(opt.name)}</span>
+                        <input class="hvt-vd-opt-name-input" value="${esc(opt.name)}">
+                        <button class="hvt-vd-save-btn hvt-btn"
+                            data-req="${esc(g.request_id)}" data-opt="${esc(opt.id)}">选用</button>
+                    </div>
+                </div>
+            `).join('')}
+        `).join('');
+
+        // Preview buttons
+        optionsEl.querySelectorAll('.hvt-vd-preview-btn').forEach(btn => {
+            btn.addEventListener('click', () =>
+                vdPlayPreview(btn.dataset.req, btn.dataset.opt, btn));
+        });
+
+        // Click name → edit
+        optionsEl.querySelectorAll('.hvt-vd-opt-name').forEach(span => {
+            span.addEventListener('click', () => {
+                const inp = span.nextElementSibling;
+                span.style.display = 'none';
+                inp.style.display = 'block';
+                inp.focus(); inp.select();
+            });
+        });
+        optionsEl.querySelectorAll('.hvt-vd-opt-name-input').forEach(inp => {
+            const commit = () => {
+                const span = inp.previousElementSibling;
+                if (inp.value.trim()) span.textContent = inp.value.trim();
+                inp.style.display = 'none';
+                span.style.display = '';
+            };
+            inp.addEventListener('blur', commit);
+            inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); commit(); } });
+        });
+
+        // Save buttons
+        optionsEl.querySelectorAll('.hvt-vd-save-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const card = btn.closest('.hvt-vd-card');
+                const nameSpan = card.querySelector('.hvt-vd-opt-name');
+                const nameInp  = card.querySelector('.hvt-vd-opt-name-input');
+                const displayName = (nameInp.style.display !== 'none'
+                    ? nameInp.value : nameSpan.textContent).trim();
+                vdSave(btn.dataset.req, btn.dataset.opt, displayName, btn, card);
+            });
+        });
+    }
+
     async function vdGenerate() {
         const promptEl  = document.getElementById('hvt-vd-prompt');
         const genBtn    = document.getElementById('hvt-vd-generate');
         const statusEl  = document.getElementById('hvt-vd-status');
         const optionsEl = document.getElementById('hvt-vd-options');
 
-        const name   = 'Voice';
         const prompt = (promptEl.value || '').trim();
         if (!prompt) { showToast('请输入提示词', 'error'); return; }
 
@@ -1266,66 +1345,8 @@
         if (vdAudioEl) { vdAudioEl.pause(); vdAudioEl = null; }
 
         try {
-            const data = await heygenApi('/v1/voice/voice_design/create', {
-                method: 'POST',
-                body: JSON.stringify({ name, prompt, prefer_stream: true }),
-            });
-            const { request_id, options } = data;
-            if (!options || options.length === 0) throw new Error('未返回声音选项');
-
-            optionsEl.innerHTML = options.map(opt => `
-                <div class="hvt-vd-card">
-                    <div class="hvt-vd-card-top">
-                        <button class="hvt-vd-preview-btn" data-req="${esc(request_id)}" data-opt="${esc(opt.id)}" data-url="${esc(opt.audio_url || '')}" title="试听">
-                            <svg class="ic-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/></svg>
-                            <svg class="ic-stop" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>
-                        </button>
-                        <span class="hvt-vd-opt-name" title="点击改名">${esc(opt.name)}</span>
-                        <input class="hvt-vd-opt-name-input" value="${esc(opt.name)}">
-                        <button class="hvt-vd-save-btn hvt-btn"
-                            data-req="${esc(request_id)}" data-opt="${esc(opt.id)}">选用</button>
-                    </div>
-                </div>
-            `).join('');
-
-            // Preview buttons
-            optionsEl.querySelectorAll('.hvt-vd-preview-btn').forEach(btn => {
-                btn.addEventListener('click', () =>
-                    vdPlayPreview(btn.dataset.req, btn.dataset.opt, btn));
-            });
-
-            // Click name → edit
-            optionsEl.querySelectorAll('.hvt-vd-opt-name').forEach(span => {
-                span.addEventListener('click', () => {
-                    const inp = span.nextElementSibling;
-                    span.style.display = 'none';
-                    inp.style.display = 'block';
-                    inp.focus(); inp.select();
-                });
-            });
-            optionsEl.querySelectorAll('.hvt-vd-opt-name-input').forEach(inp => {
-                const commit = () => {
-                    const span = inp.previousElementSibling;
-                    if (inp.value.trim()) span.textContent = inp.value.trim();
-                    inp.style.display = 'none';
-                    span.style.display = '';
-                };
-                inp.addEventListener('blur', commit);
-                inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); commit(); } });
-            });
-
-            // Save buttons
-            optionsEl.querySelectorAll('.hvt-vd-save-btn').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    const card = btn.closest('.hvt-vd-card');
-                    const nameSpan = card.querySelector('.hvt-vd-opt-name');
-                    const nameInp  = card.querySelector('.hvt-vd-opt-name-input');
-                    const displayName = (nameInp.style.display !== 'none'
-                        ? nameInp.value : nameSpan.textContent).trim();
-                    vdSave(btn.dataset.req, btn.dataset.opt, displayName, btn, card);
-                });
-            });
-
+            const groups = await vdCreateVoices([{ label: '', prompt }], statusEl);
+            vdRenderOptionGroups(groups);
         } catch (e) {
             statusEl.textContent = '生成失败: ' + e.message;
             showToast('生成失败: ' + e.message, 'error', 4000);
@@ -1486,7 +1507,7 @@
             const data    = await heygenApi(path);
             const prompt  = data && data.prompt;
             if (!prompt) throw new Error('未返回提示词');
-            promptEl.value = prompt;
+            promptEl.value = vdApplyRefine(prompt);
             statusEl.textContent = '✅ 已生成提示词，可编辑后点「生成」';
             statusEl.className = 'hvt-vd-photo-ok';
             showToast('✅ 已根据头像生成提示词', 'success', 3000);
@@ -1494,6 +1515,267 @@
             statusEl.textContent = '分析失败: ' + e.message;
             statusEl.className = 'hvt-vd-photo-err';
             showToast('头像分析失败: ' + e.message, 'error', 4000);
+        }
+    }
+
+    // ─── 引擎切换 + HeyGen 风格补充 ───────────────────────────────────────────
+    const VD_ENGINE_KEY      = 'hvt_vd_engine';
+    const VD_REFINE_ON_KEY   = 'hvt_vd_refine_on';
+    const VD_REFINE_TEXT_KEY = 'hvt_vd_refine_text';
+
+    function vdSetEngine(engine) {
+        try { localStorage.setItem(VD_ENGINE_KEY, engine); } catch {}
+        document.querySelectorAll('.hvt-vd-engine-tab').forEach(t =>
+            t.classList.toggle('hvt-active', t.dataset.engine === engine));
+        document.getElementById('hvt-vd-engine-heygen').style.display = engine === 'heygen' ? '' : 'none';
+        document.getElementById('hvt-vd-engine-gemini').style.display = engine === 'gemini' ? '' : 'none';
+        document.getElementById('hvt-gm-settings-toggle').style.display = engine === 'gemini' ? '' : 'none';
+        if (engine !== 'gemini') document.getElementById('hvt-gm-settings').style.display = 'none';
+    }
+
+    // 勾选"追加风格补充"时把模板拼到 HeyGen photo.prompt 结果之后
+    function vdApplyRefine(prompt) {
+        const on    = document.getElementById('hvt-vd-refine-on');
+        const extra = (document.getElementById('hvt-vd-refine-text').value || '').trim();
+        if (!on || !on.checked || !extra) return prompt;
+        return prompt.trim().replace(/\.?\s*$/, '.') + ' ' + extra;
+    }
+
+    // ─── Gemini 引擎：多图 → 3 个声音设计提示词方案 ─────────────────────────────
+    const GM_STORE_KEY     = 'hvt_gm_settings';
+    const GM_DEFAULT_MODEL = 'gemini-2.5-flash';
+    const GM_MAX_IMAGES    = 6;
+    // 默认系统指令（框架版，待精调）。用户在设置里改过则以 storage 为准。
+    const GM_DEFAULT_SYS_PROMPT = `You are an expert American English voice casting director with deep specialization in Christian faith-based media. You have 20+ years of experience in US religious broadcasting, church media production, and audio content for American Christian audiences across all denominations.
+
+**Your expertise includes:**
+- How mainstream American Christian audiences perceive voice-to-appearance matching for AI avatar videos
+- All major American English accent types and their regional/cultural associations
+- The specific vocal qualities needed for different types of faith content (prayer, Scripture narration, prophetic declaration, devotional sharing, personal intercession)
+- Writing voice design prompts for TTS voice-generation systems (such as HeyGen Voice Design), where a short English description of a voice is used to synthesize it
+
+**Your task:**
+I produce short AI avatar videos (under 1 minute each) for American English-speaking Christian audiences. I will send you one or more reference images of a person (the AI avatar). Based on the person's appearance, infer the voice that mainstream American Christian audiences would EXPECT and TRUST when hearing this person speak, then write ready-to-use English voice design prompts.
+
+**How to reason (internally, before writing prompts):**
+1. From the image(s), assess: gender; perceived age band (Young Adult 20-30 / Adult 30-45 / Mature 45-60 / Senior 60+); overall vibe (clothing, setting, expression — e.g. pastor-like, casual devotional, scholarly, motherly, youthful worship leader).
+2. Choose ONE best-fit accent from: General American / Southern / African American English / Midwestern / Northeastern / Texan / Western-Californian. Default to General American unless appearance and cultural context strongly suggest otherwise; never force a stereotyped accent — when in doubt, General American.
+3. Choose voice attributes using these vocabularies:
+   - Pitch: Deep / Medium-Low / Medium / Medium-High / High
+   - Timbre (pick 1-2): Smooth / Husky / Rich / Bright / Warm / Gravelly / Crisp / Breathy
+   - Persona (pick 1-2): Steady / Gentle / Authoritative / Passionate / Casual / Solemn / Compassionate / Urgent
+   - Pace: Slow / Slow-to-moderate / Moderate / Fast
+4. If the user's note specifies a content type (prayer, Scripture narration, personal intercession, prophetic declaration, devotional sharing / testimony), weight the attributes toward that use; otherwise optimize for a versatile devotional/narration voice.
+5. If multiple images are provided, treat them as the SAME person from different angles/scenes and synthesize one consistent judgment. If images clearly show different people, analyze only the first person and say so.
+
+**Critical guidelines:**
+- Base ALL choices on how well the voice would be received and trusted by mainstream American Christian audiences.
+- Be decisive. Do not hedge with "could be either".
+- Voice design prompts must be in ENGLISH, 2-4 sentences each, concrete and audio-focused: gender, age, accent, pitch, timbre, delivery/persona, pace, and intended content type. Never mention the image, appearance, ethnicity, or clothing in the prompt itself — describe only the VOICE.
+- The three prompts must be meaningfully different renditions (e.g. warmer/intimate vs. more authoritative vs. brighter/younger energy), all still matching the person.
+- Do NOT provide any commentary outside the format below.
+
+**Output EXACTLY in the following format (analysis in Chinese, prompts in English):**
+
+### 人物判断
+| 维度 | 结果 |
+|------|------|
+| 性别 | Male / Female |
+| 感知年龄段 | 〔四选一〕 |
+| 形象气质 | 〔30字以内〕 |
+| 口音选择 | 〔七选一 + 10字以内理由〕 |
+| 音高/音色/气质/语速 | 〔如 Medium-Low · Warm+Rich · Steady+Compassionate · Slow-to-moderate〕 |
+| 最适合内容 | 〔从：信仰祷告/灵修带领、圣经叙事、个人代祷、先知性宣告、日常灵修分享 中选1-2个〕 |
+
+### 声音设计提示词
+
+**方案1（主推 — 最贴合形象）**
+\`\`\`prompt
+〔English voice design prompt〕
+\`\`\`
+
+**方案2（变体 — 〔一句话说明差异方向〕）**
+\`\`\`prompt
+〔English voice design prompt〕
+\`\`\`
+
+**方案3（变体 — 〔一句话说明差异方向〕）**
+\`\`\`prompt
+〔English voice design prompt〕
+\`\`\`
+
+### 使用提示
+〔40字以内：推荐语速设置、情感提示词、试听时注意什么〕`;
+
+    let gmImages = []; // base64 (jpeg, 已压缩) 的参考图列表
+
+    function gmGetSettings() {
+        let s = {};
+        try { s = JSON.parse(localStorage.getItem(GM_STORE_KEY)) || {}; } catch {}
+        return {
+            apiKey:    s.apiKey || '',
+            model:     s.model || GM_DEFAULT_MODEL,
+            sysPrompt: s.sysPrompt || GM_DEFAULT_SYS_PROMPT,
+        };
+    }
+
+    function gmLoadSettingsUI() {
+        const st = gmGetSettings();
+        document.getElementById('hvt-gm-key').value   = st.apiKey;
+        document.getElementById('hvt-gm-model').value = st.model;
+        document.getElementById('hvt-gm-sys').value   = st.sysPrompt;
+    }
+
+    function gmSaveSettings() {
+        const s = {
+            apiKey:    document.getElementById('hvt-gm-key').value.trim(),
+            model:     document.getElementById('hvt-gm-model').value.trim() || GM_DEFAULT_MODEL,
+            sysPrompt: document.getElementById('hvt-gm-sys').value.trim() || GM_DEFAULT_SYS_PROMPT,
+        };
+        try { localStorage.setItem(GM_STORE_KEY, JSON.stringify(s)); } catch {}
+        showToast('✅ Gemini 设置已保存', 'success');
+    }
+
+    function gmBlobToBase64(blob) {
+        return new Promise((resolve, reject) => {
+            const r = new FileReader();
+            r.onload  = () => resolve(String(r.result).split(',')[1]);
+            r.onerror = () => reject(new Error('读取图片失败'));
+            r.readAsDataURL(blob);
+        });
+    }
+
+    async function gmAddFiles(files) {
+        for (const f of files) {
+            if (gmImages.length >= GM_MAX_IMAGES) { showToast(`最多 ${GM_MAX_IMAGES} 张图片`, 'error'); break; }
+            try {
+                const blob = await vdResizeImage(f);
+                gmImages.push(await gmBlobToBase64(blob));
+            } catch (e) {
+                showToast('图片处理失败: ' + e.message, 'error');
+            }
+        }
+        gmRenderThumbs();
+    }
+
+    function gmRenderThumbs() {
+        const el = document.getElementById('hvt-gm-thumbs');
+        el.innerHTML = gmImages.map((b, i) => `
+            <span class="hvt-gm-thumb">
+                <img src="data:image/jpeg;base64,${b}" alt="">
+                <button data-i="${i}" title="移除">✕</button>
+            </span>`).join('');
+        el.querySelectorAll('button').forEach(btn => {
+            btn.addEventListener('click', () => {
+                gmImages.splice(Number(btn.dataset.i), 1);
+                gmRenderThumbs();
+            });
+        });
+    }
+
+    // 从 Gemini 回复中提取 ```prompt 代码块；没有则退化为任意代码块
+    function gmParsePrompts(text) {
+        let m = [...text.matchAll(/```prompt\s*\n([\s\S]*?)```/g)].map(x => x[1].trim()).filter(Boolean);
+        if (!m.length) m = [...text.matchAll(/```\s*\n([\s\S]*?)```/g)].map(x => x[1].trim()).filter(Boolean);
+        return m;
+    }
+
+    async function gmAnalyze() {
+        const st = gmGetSettings();
+        if (!st.apiKey) {
+            document.getElementById('hvt-gm-settings').style.display = '';
+            showToast('请先填写 Gemini API Key（aistudio.google.com 免费获取）', 'error', 4000);
+            return;
+        }
+        if (!gmImages.length) { showToast('请先添加至少一张人物图片', 'error'); return; }
+
+        const btn      = document.getElementById('hvt-gm-analyze');
+        const statusEl = document.getElementById('hvt-gm-status');
+        const resultEl = document.getElementById('hvt-gm-result');
+        btn.disabled = true;
+        btn.textContent = '⏳ 分析中…';
+        statusEl.textContent = '';
+        try {
+            const resp = await chrome.runtime.sendMessage({
+                type: 'hvt_gemini_generate',
+                apiKey: st.apiKey,
+                model: st.model,
+                systemPrompt: st.sysPrompt,
+                images: gmImages,
+                userNote: document.getElementById('hvt-gm-note').value.trim(),
+            });
+            if (!resp || !resp.ok) throw new Error((resp && resp.error) || '无响应');
+            const prompts = gmParsePrompts(resp.text);
+            document.getElementById('hvt-gm-analysis-text').textContent = resp.text;
+            if (!prompts.length) {
+                resultEl.style.display = '';
+                document.getElementById('hvt-gm-analysis').open = true;
+                throw new Error('未解析到提示词代码块，可查看完整回复');
+            }
+            gmRenderPrompts(prompts);
+            resultEl.style.display = '';
+            statusEl.textContent = `✅ 已生成 ${prompts.length} 个方案，勾选后点「生成所选声音」`;
+            statusEl.className = 'hvt-vd-photo-ok';
+        } catch (e) {
+            statusEl.textContent = '分析失败: ' + e.message;
+            statusEl.className = 'hvt-vd-photo-err';
+            showToast('Gemini 分析失败: ' + e.message, 'error', 4000);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '🔮 分析生成提示词';
+        }
+    }
+
+    function gmRenderPrompts(prompts) {
+        const el = document.getElementById('hvt-gm-prompts');
+        el.innerHTML = prompts.map((p, i) => `
+            <div class="hvt-gm-prompt-card">
+                <label class="hvt-gm-prompt-head">
+                    <input type="checkbox" class="hvt-gm-prompt-check" checked>
+                    <span>方案${i + 1}</span>
+                </label>
+                <textarea class="hvt-vd-textarea hvt-gm-prompt-text">${esc(p)}</textarea>
+                <button class="hvt-btn hvt-gm-fill">填入提示词框</button>
+            </div>`).join('');
+        el.querySelectorAll('.hvt-gm-fill').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const card = btn.closest('.hvt-gm-prompt-card');
+                document.getElementById('hvt-vd-prompt').value =
+                    card.querySelector('.hvt-gm-prompt-text').value.trim();
+                showToast('已填入提示词框，可编辑后点「⚡ 生成」', 'success');
+            });
+        });
+    }
+
+    async function gmCreateSelected() {
+        const items = [...document.querySelectorAll('#hvt-gm-prompts .hvt-gm-prompt-card')]
+            .map((card, i) => ({
+                checked: card.querySelector('.hvt-gm-prompt-check').checked,
+                label: `方案${i + 1}`,
+                prompt: card.querySelector('.hvt-gm-prompt-text').value.trim(),
+            }))
+            .filter(it => it.checked && it.prompt);
+        if (!items.length) { showToast('请先勾选至少一个方案', 'error'); return; }
+
+        const btn      = document.getElementById('hvt-gm-create');
+        const statusEl = document.getElementById('hvt-gm-status');
+        btn.disabled = true;
+        btn.textContent = '⏳ 生成中…';
+        try {
+            const groups = await vdCreateVoices(items, statusEl);
+            vdRenderOptionGroups(groups);
+            const total = groups.reduce((n, g) => n + g.options.length, 0);
+            statusEl.textContent = `✅ 已生成 ${total} 个声音，下方试听后点「选用」保存`;
+            statusEl.className = 'hvt-vd-photo-ok';
+            document.getElementById('hvt-vd-options')
+                .scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        } catch (e) {
+            statusEl.textContent = '生成失败: ' + e.message;
+            statusEl.className = 'hvt-vd-photo-err';
+            showToast('生成失败: ' + e.message, 'error', 4000);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '⚡ 生成所选声音';
         }
     }
 
@@ -1955,7 +2237,7 @@
     // Stream preview audio from HeyGen API → Uint8Array of MP3 bytes
     // Endpoint: POST /v2/online/voice.stream_preview  body: {voice_id, language}
     // Response: application/x-ndjson, each line = {audio_bytes: base64} | heartbeat
-    async function mvStreamPreview(voiceId, language) {
+    async function mvStreamPreview(voiceId, language, spaceId) {
         const res = await fetch(`${API_BASE}/v2/online/voice.stream_preview`, {
             method: 'POST',
             credentials: 'include',
@@ -1963,6 +2245,8 @@
                 ...HVT_FETCH_HEADERS,
                 'content-type': 'application/json',
                 'accept': 'application/x-ndjson',
+                'x-heygen-service': 'voice',
+                ...(spaceId ? { 'x-space-id': spaceId } : {}),
             },
             body: JSON.stringify({ voice_id: voiceId, language: language || 'English' }),
         });
@@ -1998,7 +2282,9 @@
         const btn = document.querySelector(`.hvt-mv-play-btn[data-mv-id="${CSS.escape(id)}"]`);
         if (btn) { btn.dataset.loading = '1'; btn.disabled = true; delete btn.dataset.errored; }
         try {
-            const audioBytes = await mvStreamPreview(id, v.language || 'English');
+            if (!myUsername) myUsername = await expGetMyUsername();
+            const spaceId = v._space || myUsername;
+            const audioBytes = await mvStreamPreview(id, v.language || 'English', spaceId);
             const blob = new Blob([audioBytes], { type: 'audio/mpeg' });
             const blobUrl = URL.createObjectURL(blob);
             mvPlayingId = id;
@@ -2219,6 +2505,7 @@
                     <svg class="ic-spin" viewBox="0 0 24 24" style="display:none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2.5" fill="none" stroke-dasharray="28" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/></circle></svg>
                 </button>
                 <span class="hvt-mv-name" title="${esc(name)}">${esc(name)}</span>
+                <button class="hvt-mv-name-copy-btn" title="复制名称">📋</button>
                 ${genderIcon ? `<span class="hvt-mv-gender ${gender === 'female' ? 'hvt-f' : 'hvt-m'}">${genderIcon}</span>` : ''}
                 ${lang ? `<span class="hvt-mv-locale">${esc(lang)}</span>` : ''}
                 ${eng ? `<span class="hvt-mv-engine ${eng.cls}" title="引擎: ${esc(eng.full)}">${esc(eng.short)}</span>` : ''}
@@ -2234,6 +2521,15 @@
                 mvUpdateSelectionUI();
             });
             row.querySelector('.hvt-mv-play-btn').addEventListener('click', () => mvTogglePlay(v));
+            row.querySelector('.hvt-mv-name-copy-btn').addEventListener('click', e => {
+                navigator.clipboard.writeText(name).then(() => {
+                    const btn = e.currentTarget;
+                    const orig = btn.textContent;
+                    btn.textContent = '✓';
+                    btn.classList.add('hvt-copied');
+                    setTimeout(() => { btn.textContent = orig; btn.classList.remove('hvt-copied'); }, 1200);
+                });
+            });
             row.querySelector('.hvt-mv-copy-btn').addEventListener('click', e => {
                 navigator.clipboard.writeText(id).then(() => {
                     const btn = e.currentTarget;
@@ -2300,6 +2596,7 @@
                 </button>
                 <span class="hvt-sp-origin ${isShared ? 'hvt-sp-shared' : 'hvt-sp-self'}" title="${isShared ? '由社区外账号分享进来' : '在本社区内创建'}">${isShared ? '分享进来' : '自生成'}</span>
                 <span class="hvt-mv-name" title="${esc(name)}">${esc(name)}</span>
+                <button class="hvt-mv-name-copy-btn" title="复制名称">📋</button>
                 ${genderIcon ? `<span class="hvt-mv-gender ${gender === 'female' ? 'hvt-f' : 'hvt-m'}">${genderIcon}</span>` : ''}
                 ${lang ? `<span class="hvt-mv-locale">${esc(lang)}</span>` : ''}
                 ${eng ? `<span class="hvt-mv-engine ${eng.cls}" title="引擎: ${esc(eng.full)}">${esc(eng.short)}</span>` : ''}
@@ -2314,6 +2611,15 @@
                 mvUpdateSelectionUI();
             });
             row.querySelector('.hvt-mv-play-btn').addEventListener('click', () => mvTogglePlay(v));
+            row.querySelector('.hvt-mv-name-copy-btn').addEventListener('click', e => {
+                navigator.clipboard.writeText(name).then(() => {
+                    const btn = e.currentTarget;
+                    const orig = btn.textContent;
+                    btn.textContent = '✓';
+                    btn.classList.add('hvt-copied');
+                    setTimeout(() => { btn.textContent = orig; btn.classList.remove('hvt-copied'); }, 1200);
+                });
+            });
             row.querySelector('.hvt-mv-copy-btn').addEventListener('click', e => {
                 navigator.clipboard.writeText(id).then(() => {
                     const btn = e.currentTarget; const orig = btn.textContent;
@@ -3639,14 +3945,66 @@
               </div>
               <div id="hvt-vd-body">
                 <div class="hvt-vd-form-row">
-                  <label class="hvt-vd-label">上传头像（HeyGen 分析人脸自动生成提示词，可选）</label>
-                  <div id="hvt-vd-photo-row">
-                    <label id="hvt-vd-photo-drop" for="hvt-vd-photo-input">
-                      <img id="hvt-vd-photo-thumb" alt="">
-                      <span id="hvt-vd-photo-placeholder">📷 点击选择头像图片</span>
-                    </label>
-                    <input id="hvt-vd-photo-input" type="file" accept="image/*" hidden>
-                    <span id="hvt-vd-photo-status"></span>
+                  <div id="hvt-vd-engine-row">
+                    <label class="hvt-vd-label">上传头像生成提示词（可选）</label>
+                    <div id="hvt-vd-engine-tabs">
+                      <button class="hvt-vd-engine-tab" data-engine="heygen">HeyGen 官方</button>
+                      <button class="hvt-vd-engine-tab" data-engine="gemini">Gemini AI</button>
+                    </div>
+                    <button id="hvt-gm-settings-toggle" class="hvt-btn" title="Gemini 设置" style="display:none">⚙ 设置</button>
+                  </div>
+                  <div id="hvt-gm-settings" style="display:none">
+                    <div class="hvt-gm-set-row">
+                      <label>API Key</label>
+                      <input id="hvt-gm-key" class="hvt-input" type="password" placeholder="在 aistudio.google.com 免费获取">
+                    </div>
+                    <div class="hvt-gm-set-row">
+                      <label>模型</label>
+                      <input id="hvt-gm-model" class="hvt-input" placeholder="gemini-2.5-flash">
+                    </div>
+                    <div class="hvt-gm-set-row hvt-gm-set-col">
+                      <label>系统指令（可精调，输出格式须保留 \`\`\`prompt 代码块）</label>
+                      <textarea id="hvt-gm-sys" class="hvt-vd-textarea"></textarea>
+                    </div>
+                    <div class="hvt-gm-set-actions">
+                      <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">获取免费 API Key ↗</a>
+                      <button id="hvt-gm-sys-reset" class="hvt-btn">恢复默认指令</button>
+                      <button id="hvt-gm-save" class="hvt-btn hvt-btn-primary">保存设置</button>
+                    </div>
+                  </div>
+                  <div id="hvt-vd-engine-heygen">
+                    <div id="hvt-vd-photo-row">
+                      <label id="hvt-vd-photo-drop" for="hvt-vd-photo-input">
+                        <img id="hvt-vd-photo-thumb" alt="">
+                        <span id="hvt-vd-photo-placeholder">📷 点击选择头像图片</span>
+                      </label>
+                      <input id="hvt-vd-photo-input" type="file" accept="image/*" hidden>
+                      <span id="hvt-vd-photo-status"></span>
+                    </div>
+                    <div id="hvt-vd-refine-row">
+                      <label id="hvt-vd-refine-label"><input id="hvt-vd-refine-on" type="checkbox"> 追加风格补充（拼接到 HeyGen 提示词后）</label>
+                      <textarea id="hvt-vd-refine-text" class="hvt-vd-textarea" style="display:none" placeholder="例：Warm and steady delivery, slow-to-moderate pace, suited for devotional narration for an American Christian audience."></textarea>
+                    </div>
+                  </div>
+                  <div id="hvt-vd-engine-gemini" style="display:none">
+                    <div id="hvt-gm-photo-row">
+                      <div id="hvt-gm-thumbs"></div>
+                      <label id="hvt-gm-add" for="hvt-gm-input" title="可添加多张同一人物的图片（最多6张）">＋ 添加图片</label>
+                      <input id="hvt-gm-input" type="file" accept="image/*" multiple hidden>
+                    </div>
+                    <input id="hvt-gm-note" class="hvt-input" placeholder="备注（可选）：如“主要用于圣经叙事”">
+                    <div class="hvt-vd-form-actions">
+                      <button id="hvt-gm-analyze" class="hvt-btn hvt-btn-primary">🔮 分析生成提示词</button>
+                      <span id="hvt-gm-status"></span>
+                    </div>
+                    <div id="hvt-gm-result" style="display:none">
+                      <details id="hvt-gm-analysis"><summary>查看 Gemini 完整分析</summary><pre id="hvt-gm-analysis-text"></pre></details>
+                      <div id="hvt-gm-prompts"></div>
+                      <div class="hvt-vd-form-actions">
+                        <button id="hvt-gm-create" class="hvt-btn hvt-btn-primary">⚡ 生成所选声音</button>
+                        <span id="hvt-gm-create-hint">每个方案出 3 个声音：勾 1/2/3 个方案 → 一次得 3/6/9 个声音</span>
+                      </div>
+                    </div>
                   </div>
                 </div>
                 <div class="hvt-vd-form-row">
@@ -4208,6 +4566,44 @@
         });
         document.getElementById('hvt-vd-overlay').addEventListener('click', (e) => {
             if (e.target === document.getElementById('hvt-vd-overlay')) closeVoiceDesign();
+        });
+
+        // Voice Design: 引擎切换 + Gemini 设置 + 风格补充
+        document.querySelectorAll('.hvt-vd-engine-tab').forEach(tab => {
+            tab.addEventListener('click', () => vdSetEngine(tab.dataset.engine));
+        });
+        vdSetEngine(localStorage.getItem(VD_ENGINE_KEY) === 'gemini' ? 'gemini' : 'heygen');
+
+        document.getElementById('hvt-gm-settings-toggle').addEventListener('click', () => {
+            const el = document.getElementById('hvt-gm-settings');
+            el.style.display = el.style.display === 'none' ? '' : 'none';
+        });
+        gmLoadSettingsUI();
+        document.getElementById('hvt-gm-save').addEventListener('click', gmSaveSettings);
+        document.getElementById('hvt-gm-sys-reset').addEventListener('click', () => {
+            document.getElementById('hvt-gm-sys').value = GM_DEFAULT_SYS_PROMPT;
+            showToast('已恢复默认指令，点「保存设置」生效', 'info');
+        });
+
+        document.getElementById('hvt-gm-input').addEventListener('change', (e) => {
+            const files = [...(e.target.files || [])];
+            e.target.value = '';
+            if (files.length) gmAddFiles(files);
+        });
+        document.getElementById('hvt-gm-analyze').addEventListener('click', gmAnalyze);
+        document.getElementById('hvt-gm-create').addEventListener('click', gmCreateSelected);
+
+        const refineOn   = document.getElementById('hvt-vd-refine-on');
+        const refineText = document.getElementById('hvt-vd-refine-text');
+        refineOn.checked = localStorage.getItem(VD_REFINE_ON_KEY) === '1';
+        refineText.value = localStorage.getItem(VD_REFINE_TEXT_KEY) || '';
+        refineText.style.display = refineOn.checked ? '' : 'none';
+        refineOn.addEventListener('change', () => {
+            localStorage.setItem(VD_REFINE_ON_KEY, refineOn.checked ? '1' : '0');
+            refineText.style.display = refineOn.checked ? '' : 'none';
+        });
+        refineText.addEventListener('input', () => {
+            localStorage.setItem(VD_REFINE_TEXT_KEY, refineText.value);
         });
 
         // Main table: select-all checkbox
