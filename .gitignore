@@ -1,0 +1,5 @@
+.DS_Store
+*.zip
+.playwright-mcp/
+.claude/worktrees/
+docs/screenshots/

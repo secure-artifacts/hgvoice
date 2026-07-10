@@ -94,7 +94,7 @@
     }
 
     function findAvatarIIIItem() {
-        const item = [...document.querySelectorAll('[role="menuitem"],[role="option"],[role="menuitemradio"],[data-radix-collection-item],button,li,a,div,span')]
+        const item = [...document.querySelectorAll('[role="menuitem"],[role="option"],[role="menuitemradio"],[data-radix-collection-item]')]
             .map(el => ({ el, text: cleanText(el) }))
             .filter(x => isAvatarIIIItem(x.text))
             .sort((a, b) => a.text.length - b.text.length)[0]?.el || null;

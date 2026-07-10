@@ -41,6 +41,16 @@ const proc11ShareVoice = (() => {
         );
     }
 
+    // 按邮箱文本从当前 DOM 实时定位行（React 删除后重渲染会替换节点，
+    // 不能持有旧引用）
+    function _findRowByEmail(dialog, email) {
+        // 用邮箱精确匹配（行内提取到的邮箱 === 目标），避免 bob@x.com
+        // 子串命中 thebob@x.com 所在行导致误删
+        return _getDeleteBtns(dialog)
+            .map(b => b.parentElement)
+            .find(row => _extractEmails(row.textContent).includes(email)) || null;
+    }
+
     // 邮箱列表父容器（所有 row 的直接父节点）
     function _getListContainer(dialog) {
         const deleteBtns = _getDeleteBtns(dialog);
@@ -156,28 +166,35 @@ const proc11ShareVoice = (() => {
         });
 
         document.getElementById('hg11-del-sel-btn').addEventListener('click', async () => {
-            const checked = Array.from(dialog.querySelectorAll('.hg11-cb:checked'));
-            if (!checked.length) return;
+            // 先快照勾选行的邮箱字符串；每删一个 React 会重渲染整表，
+            // DOM 引用会失效，后续必须按邮箱实时重新定位
+            const emails = Array.from(dialog.querySelectorAll('.hg11-cb:checked'))
+                .map(cb => _extractEmails(cb.parentElement.textContent)[0])
+                .filter(Boolean);
+            if (!emails.length) return;
 
             const btn    = document.getElementById('hg11-del-sel-btn');
             const status = document.getElementById('hg11-del-status');
             btn.disabled = true;
 
-            let deleted = 0;
-            for (let i = 0; i < checked.length; i++) {
-                status.textContent = `删除中 ${i + 1}/${checked.length}…`;
-                const row    = checked[i].parentElement;
-                const delBtn = row.querySelector('button.tw-cursor-pointer');
-                if (delBtn) {
-                    delBtn.click();
-                    await _randomDelay(); // 2~5 秒随机，避免过快失效
-                    deleted++;
-                }
+            let deleted = 0, failed = 0;
+            for (let i = 0; i < emails.length; i++) {
+                status.textContent = `删除中 ${i + 1}/${emails.length}…`;
+                const row = _findRowByEmail(dialog, emails[i]);
+                const delBtn = row && _getDeleteBtns(dialog).find(b => b.parentElement === row);
+                if (!delBtn) { failed++; continue; }
+                delBtn.click();
+                await _randomDelay(); // 2~5 秒随机，避免过快失效
+                // 行仍在 = 删除未生效，不计成功
+                if (_findRowByEmail(dialog, emails[i])) failed++;
+                else deleted++;
             }
 
             const selAll = document.getElementById('hg11-sel-all');
             if (selAll) selAll.checked = false;
-            status.textContent = `✅ 已删除 ${deleted} 个`;
+            status.textContent = failed > 0
+                ? `✅ 已删除 ${deleted} 个，${failed} 个失败`
+                : `✅ 已删除 ${deleted} 个`;
             btn.disabled = false;
         });
     }

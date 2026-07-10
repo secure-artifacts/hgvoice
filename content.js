@@ -941,11 +941,13 @@
         const banner = document.getElementById('hvt-update-banner');
         banner.classList.remove('hvt-ub-guide');
         banner.style.display = '';
+        // tag_name/html_url 来自 GitHub API 响应，须转义/校验后才能进 innerHTML
+        const notesUrl = /^https:\/\/github\.com\//.test(info.htmlUrl || '') ? info.htmlUrl : '';
         banner.innerHTML = `
             <span class="hvt-ub-icon">🔔</span>
-            <span class="hvt-ub-text">发现新版本 <b>${info.latest}</b>（当前 ${info.current}）</span>
+            <span class="hvt-ub-text">发现新版本 <b>${esc(info.latest)}</b>（当前 ${esc(info.current)}）</span>
             <button id="hvt-ub-upgrade" class="hvt-btn hvt-btn-primary">立即升级</button>
-            <a id="hvt-ub-notes" class="hvt-btn" href="${info.htmlUrl}" target="_blank" rel="noopener">查看更新内容</a>
+            ${notesUrl ? `<a id="hvt-ub-notes" class="hvt-btn" href="${esc(notesUrl)}" target="_blank" rel="noopener">查看更新内容</a>` : ''}
             <button id="hvt-ub-ignore" class="hvt-btn">忽略此版本</button>
         `;
         document.getElementById('hvt-ub-upgrade').addEventListener('click', onUpdateUpgrade);
@@ -3119,7 +3121,11 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             if (seenRows.has(rowKey)) continue;
             seenRows.add(rowKey);
             const itemProjectId = pvProjectIdOf(item) || item._projectId || '';
-            const folder = projectMap.get(`${spaceId}::${itemProjectId}`) || projectMap.get(`${spaceId}::`) || {
+            // 非根 project_id 解析失败时不得回退到根目录条目，否则台账/位置变更
+            // 文案会把「未知文件夹」误记成「根目录」
+            const folder = projectMap.get(`${spaceId}::${itemProjectId}`)
+                || (itemProjectId ? null : projectMap.get(`${spaceId}::`))
+                || {
                 id: itemProjectId,
                 name: itemProjectId ? '未知文件夹' : '根目录',
                 path: itemProjectId ? '未知文件夹' : '根目录',
@@ -3657,14 +3663,14 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
 
         setStatus('正在切换声音…');
 
-        // Avatar Shots needs a real modal row selection. A cached voice object can
-        // return without error while leaving the original voice selected.
-        const bridgeOpts = isAvatarShots ? { visibleOnly: true } : {};
+        // A cached voice object can return success without error while leaving the
+        // original voice selected — always require a real modal row selection.
+        const bridgeOpts = { visibleOnly: true };
 
         // Try current (first) tab — bridge handles modal search internally if needed
-        let result = await aisBridgeSwitchUntil(targetVoiceId, bridgeOpts, isAvatarShots ? 2000 : 500);
-        if (!result.success && isAvatarShots) result = await aisSearchOpenModal(targetVoiceId, bridgeOpts);
-        if (!result.success && isAvatarShots) result = await aisExpandOpenModalUntilFound(targetVoiceId, bridgeOpts);
+        let result = await aisBridgeSwitchUntil(targetVoiceId, bridgeOpts, 2000);
+        if (!result.success) result = await aisSearchOpenModal(targetVoiceId, bridgeOpts);
+        if (!result.success) result = await aisExpandOpenModalUntilFound(targetVoiceId, bridgeOpts);
 
         // If not found, iterate the modal's tabs (我的语音 / HeyGen 库 / …).
         // Tabs carry role="tab" (language-independent), so iterate them all.
@@ -3675,21 +3681,31 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 if (tab.getAttribute('aria-selected') === 'true') continue;
                 tab.click();
                 await new Promise(r => setTimeout(r, 600));
-                result = await aisBridgeSwitchUntil(targetVoiceId, bridgeOpts, isAvatarShots ? 3000 : 500);
-                if (!result.success && isAvatarShots) result = await aisSearchOpenModal(targetVoiceId, bridgeOpts);
-                if (!result.success && isAvatarShots) result = await aisExpandOpenModalUntilFound(targetVoiceId, bridgeOpts);
+                result = await aisBridgeSwitchUntil(targetVoiceId, bridgeOpts, 3000);
+                if (!result.success) result = await aisSearchOpenModal(targetVoiceId, bridgeOpts);
+                if (!result.success) result = await aisExpandOpenModalUntilFound(targetVoiceId, bridgeOpts);
                 if (result.success) break;
             }
         }
 
         if (result.success) {
-            // Avatar 页需要显式确认才会应用：编辑器是「保存更改」，My Avatars 详情是「设为默认」。
-            // 文案随语言变，按"主按钮且带文字"定位（纯图标主按钮 #play-s/#arrow-right 自动排除）。
-            if (isAvatarShots) {
-                await new Promise(r => setTimeout(r, 200));
-                const saveBtn = [...document.querySelectorAll('[role="dialog"][data-state="open"] button')]
-                    .find(isConfirmBtn);
-                if (saveBtn) saveBtn.click();
+            // 弹窗内选中声音后，各页面都需要点确认按钮才会真正应用（编辑器是「保存更改」，
+            // My Avatars 详情是「设为默认」，AI Studio 是「選擇語音」等，文案随语言/页面变）。
+            // 按钮定位用语言无关规则：主按钮样式+带文字（纯图标主按钮 #play-s/#arrow-right 自动排除）。
+            await new Promise(r => setTimeout(r, 200));
+            const dlg = document.querySelector('[role="dialog"][data-state="open"]');
+            if (dlg) {
+                const confirmBtn = [...dlg.querySelectorAll('button')].find(b => isConfirmBtn(b) && !b.disabled);
+                if (confirmBtn) confirmBtn.click();
+                // 点了确认后必须等弹窗真正关闭才算数；没关就说明并未真正生效，不能报成功
+                const closeStart = Date.now();
+                while (Date.now() - closeStart < 2000 && document.querySelector('[role="dialog"][data-state="open"]')) {
+                    await new Promise(r => setTimeout(r, 150));
+                }
+                if (document.querySelector('[role="dialog"][data-state="open"]')) {
+                    setStatus(`切换未确认：已选中「${result.name}」但弹窗未关闭，请手动检查`, 'error');
+                    return;
+                }
             }
             setStatus(`✅ 已切换到「${result.name}」`, 'success');
             showToast(`✅ 已切换到「${result.name}」`, 'success', 2500);
@@ -3698,8 +3714,10 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         }
     }
 
-    function aisSearchVoices(q) {
-        const myToken = ++aisFallbackToken; // cancel any running fallback
+    function aisSearchVoices(q, internal = false) {
+        // internal=true: called mid-scan by aisFallbackSearch to refresh the list
+        // without cancelling its own in-flight token or re-triggering a new scan.
+        const myToken = internal ? aisFallbackToken : ++aisFallbackToken;
         const query = (q || '').trim().toLowerCase();
         const seen = new Set();
         const results = [];
@@ -3739,13 +3757,10 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
 
         aisSearchResults = results;
         aisRenderResults();
-        // Fall back to a live page-by-page fetch when the local cache can't
-        // satisfy the query: nothing matched, or the query is a full voice_id
-        // not loaded yet (covers shared voices absent from a stale cache while
-        // the background revalidation in mvEnsureCache is still in flight).
-        const looksLikeId = /^[a-z0-9]{32}$/.test(query) || /^[a-z0-9]{20}$/.test(query);
-        const hasExactId = results.some(v => (v.voice_id || '').toLowerCase() === query);
-        if (query && (results.length === 0 || (looksLikeId && !hasExactId))) {
+        if (internal) return;
+        // 本地缓存（mvVoices/spaceVoices）可能还没同步完（分享声音、其他 Space 的声音等），
+        // 凑巧命中几条不代表已经找全——只要有关键字就顺带发起一次全量扫描兜底。
+        if (query) {
             aisFallbackSearch(query, myToken);
         }
     }
@@ -3795,9 +3810,10 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                         const existing = new Set(mvVoices.map(v => v.voice_id));
                         for (const v of matched) if (!existing.has(v.voice_id)) mvVoices.push(v);
                     }
+                    // 增量刷新界面，但不中断扫描——同一上下文剩余分页、以及其他 Space
+                    // 可能还有更多匹配，必须扫完才能确认"找全了"。
                     const searchEl = document.getElementById('hvt-ais-search');
-                    aisSearchVoices(searchEl ? searchEl.value : query);
-                    return;
+                    aisSearchVoices(searchEl ? searchEl.value : query, true);
                 }
                 token = data.next_pagination_token || null;
                 if (!token) break;
@@ -3863,6 +3879,604 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         if (overlay) overlay.style.display = 'none';
     }
 
+    // ─── 批量流水线 (bp*)：免 UI 批量提交视频 ────────────────────────────────
+    // 链路：图片 → temp.create/PUT S3/temp.convert 建头像 →
+    //       POST /v2/avatar/shortcut/submit（Avatar Shots 通道，一步提交渲染）→
+    //       video.get 轮询 → 完成后下载
+    // 关键：必须走 shortcut/submit 且带 use_unlimited_mode:true +
+    //       source_type:"avatar_video_shortcut_modal"，才进不限额度的正常队列；
+    //       AI Studio 的 text_draft.generate 路径会被标 low_priority+未付费，
+    //       额度用尽时永远排不上（2026-07-09 实测踩坑）
+    // 约束：仅在 HeyGen 页面开启期间运行（content script 生命周期）
+
+    const BP_DB_KEY = 'hvt_bp_db_v1';
+    const BP_IDB    = 'hvt_bp_images';
+    let bpDb = null;
+    let bpWorkerTimer  = null;   // 提交循环 setTimeout 句柄
+    let bpPollTimer    = null;   // 轮询 setInterval 句柄
+    let bpRunning      = false;
+    let bpCurrentTask  = null;   // 正在执行链路的任务 id（防重入）
+
+    function bpLoadDb() {
+        try { bpDb = JSON.parse(localStorage.getItem(BP_DB_KEY)) || null; } catch { bpDb = null; }
+        if (!bpDb) bpDb = {};
+        bpDb.settings = Object.assign({
+            voiceId: '', forceIII: true,
+            spaceId: '',                        // 提交到哪个 Space（'' = 个人）
+            orientation: 'portrait', resolution: '720p',
+            intervalMin: 3, intervalMax: 8,     // 分钟
+            hourlyCap: 10, scheduleAt: '', autoDownload: true,
+        }, bpDb.settings || {});
+        bpDb.tasks = bpDb.tasks || [];           // {id,title,script,voiceId,status,groupId,draftId,videoUrl,error,submittedAt,hasImg}
+        bpDb.running = !!bpDb.running;
+    }
+    function bpSaveDb() { localStorage.setItem(BP_DB_KEY, JSON.stringify(bpDb)); }
+
+    // ── IndexedDB：任务图片持久化（localStorage 放不下 base64） ──
+    function bpIdbOpen() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open(BP_IDB, 1);
+            req.onupgradeneeded = () => req.result.createObjectStore('imgs');
+            req.onsuccess = () => resolve(req.result);
+            req.onerror   = () => reject(req.error);
+        });
+    }
+    async function bpIdbPut(key, blob) {
+        const db = await bpIdbOpen();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction('imgs', 'readwrite');
+            tx.objectStore('imgs').put(blob, key);
+            tx.oncomplete = () => { db.close(); resolve(); };
+            tx.onerror    = () => { db.close(); reject(tx.error); };
+        });
+    }
+    async function bpIdbGet(key) {
+        const db = await bpIdbOpen();
+        return new Promise((resolve, reject) => {
+            const req = db.transaction('imgs').objectStore('imgs').get(key);
+            req.onsuccess = () => { db.close(); resolve(req.result || null); };
+            req.onerror   = () => { db.close(); reject(req.error); };
+        });
+    }
+    async function bpIdbDel(key) {
+        const db = await bpIdbOpen();
+        return new Promise((resolve) => {
+            const tx = db.transaction('imgs', 'readwrite');
+            tx.objectStore('imgs').delete(key);
+            tx.oncomplete = () => { db.close(); resolve(); };
+            tx.onerror    = () => { db.close(); resolve(); };
+        });
+    }
+
+    function bpSpaceHeaders() {
+        const sid = bpDb.settings.spaceId;
+        return sid ? { 'x-space-id': sid } : {};
+    }
+
+    // ── 头像：图片 blob → photo avatar group_id ──
+    async function bpCreateAvatar(blob, name) {
+        const t = await heygenApi('/v1/avatar_group/photo/temp.create?num_photos=1', { headers: bpSpaceHeaders() });
+        const putUrl = t.upload_urls && t.upload_urls[0];
+        const s3Url  = t.s3_urls && t.s3_urls[0];
+        if (!putUrl || !s3Url) throw new Error('获取图片上传地址失败');
+        const up = await fetch(putUrl, {
+            method: 'PUT',
+            headers: { 'x-amz-server-side-encryption': 'AES256', 'Content-Type': 'image/jpeg' },
+            body: blob,
+        });
+        if (!up.ok) throw new Error(`图片上传失败 HTTP ${up.status}`);
+        // s3 路径形如 …/temporary_user_photar/<id>/image.jpg
+        const idMatch = s3Url.match(/temporary_user_photar\/([0-9a-f]{32})/i);
+        if (!idMatch) throw new Error('解析临时图片 ID 失败: ' + s3Url);
+        const q = new URLSearchParams({
+            parent_temporary_user_photar_id: idMatch[1],
+            ethnicity: 'Unspecified', gender: 'Unspecified', age: 'Unspecified',
+            name, skip_validation: 'true',
+        });
+        const conv = await heygenApi(`/v1/avatar_group/photo/temp.convert?${q}`, { headers: bpSpaceHeaders() });
+        if (!conv.group_id) throw new Error('创建头像未返回 group_id');
+        return conv.group_id;
+    }
+
+    // ── 提交渲染：Avatar Shots 通道，一步直达 ──
+    async function bpShortcutSubmit(task, groupId) {
+        const voiceId = task.voiceId || bpDb.settings.voiceId;
+        if (!voiceId) throw new Error('未指定声音 ID');
+        const iii = bpDb.settings.forceIII;
+        const d = await heygenApi('/v2/avatar/shortcut/submit', {
+            method: 'POST', headers: bpSpaceHeaders(),
+            body: JSON.stringify({
+                video_title: task.title,
+                video_orientation: bpDb.settings.orientation,
+                resolution: bpDb.settings.resolution,
+                avatar_id: groupId,
+                source_type: 'avatar_video_shortcut_modal',
+                fit: 'cover',
+                audio_data: { audio_type: 'tts_pending', text: task.script, voice_id: voiceId },
+                avatar_settings: { use_avatar_iv_model: !iii, use_unlimited_mode: iii },
+                enable_caption: false,
+                create_new_avatar: false,
+            }),
+        });
+        if (!d.video_id) throw new Error('提交未返回 video_id');
+        return d.video_id;
+    }
+
+    // ── 单任务全链路 ──
+    async function bpRunTask(task) {
+        const step = async (status) => { task.status = status; bpSaveDb(); bpRenderTasks(); };
+        try {
+            await step('创建头像中');
+            if (!task.groupId) {
+                const blob = await bpIdbGet(task.id);
+                if (!blob) throw new Error('任务图片丢失，请删除后重新添加');
+                task.groupId = await bpCreateAvatar(blob, task.title);
+                bpSaveDb();
+            }
+            await step('提交渲染中');
+            task.draftId = await bpShortcutSubmit(task, task.groupId);   // draftId 字段存渲染中的 video_id
+            task.submittedAt = Date.now();
+            await step('生成中');
+        } catch (e) {
+            task.error = e.message;
+            await step('失败');
+        }
+    }
+
+    // ── 提交调度：串行 + 随机间隔 + 每小时限额 + 定时启动 ──
+    function bpNextPending() {
+        return bpDb.tasks.find(t => t.status === '待提交');
+    }
+    function bpSubmittedInLastHour() {
+        const cutoff = Date.now() - 3600_000;
+        return bpDb.tasks.filter(t => t.submittedAt && t.submittedAt > cutoff).length;
+    }
+    function bpScheduleDelayMs() {
+        const at = bpDb.settings.scheduleAt;
+        if (!at) return 0;
+        const ts = new Date(at).getTime();
+        return Number.isFinite(ts) ? Math.max(0, ts - Date.now()) : 0;
+    }
+    function bpRandomIntervalMs() {
+        let lo = Math.max(0, Number(bpDb.settings.intervalMin) || 0);
+        let hi = Math.max(lo, Number(bpDb.settings.intervalMax) || lo);
+        return Math.round((lo + Math.random() * (hi - lo)) * 60_000);
+    }
+
+    function bpSetStatusLine(msg) {
+        const el = document.getElementById('hvt-bp-status');
+        if (el) el.textContent = msg || '';
+    }
+
+    async function bpWorkerTick() {
+        bpWorkerTimer = null;
+        if (!bpRunning) return;
+
+        const task = bpNextPending();
+        if (!task) {
+            bpSetStatusLine('队列中已无待提交任务（轮询下载仍在运行）');
+            return;
+        }
+        const capped = bpSubmittedInLastHour() >= (Number(bpDb.settings.hourlyCap) || Infinity);
+        if (capped) {
+            bpSetStatusLine(`已达每小时限额（${bpDb.settings.hourlyCap}），15 分钟后重试`);
+            bpWorkerTimer = setTimeout(bpWorkerTick, 15 * 60_000);
+            return;
+        }
+        bpCurrentTask = task.id;
+        bpSetStatusLine(`正在提交：${task.title}`);
+        await bpRunTask(task);
+        bpCurrentTask = null;
+
+        if (!bpRunning) return;
+        const wait = bpRandomIntervalMs();
+        bpSetStatusLine(`下一条 ${Math.round(wait / 60_000)} 分钟后提交`);
+        bpWorkerTimer = setTimeout(bpWorkerTick, wait);
+    }
+
+    function bpStart() {
+        if (bpRunning) return;
+        if (!bpDb.settings.voiceId && bpDb.tasks.some(t => t.status === '待提交' && !t.voiceId)) {
+            showToast('存在未指定声音 ID 的任务，且未设默认声音', 'error', 3500); return;
+        }
+        bpRunning = true;
+        bpDb.running = true;
+        bpSaveDb();
+        bpUpdateRunButtons();
+        const delay = bpScheduleDelayMs();
+        if (delay > 0) {
+            bpSetStatusLine(`定时启动：${new Date(Date.now() + delay).toLocaleString()}`);
+            bpWorkerTimer = setTimeout(bpWorkerTick, delay);
+        } else {
+            bpWorkerTimer = setTimeout(bpWorkerTick, 50);
+        }
+        bpEnsurePoller();
+    }
+    function bpStop() {
+        bpRunning = false;
+        bpDb.running = false;
+        bpSaveDb();
+        if (bpWorkerTimer) { clearTimeout(bpWorkerTimer); bpWorkerTimer = null; }
+        bpSetStatusLine('已暂停（生成中的任务仍会轮询下载）');
+        bpUpdateRunButtons();
+    }
+    // 运行中但 worker 已因队列空而停摆时（新增任务/重试后）重新唤醒
+    function bpKick() {
+        if (bpRunning && !bpWorkerTimer && !bpCurrentTask) {
+            bpWorkerTimer = setTimeout(bpWorkerTick, 100);
+        }
+    }
+    function bpUpdateRunButtons() {
+        const st = document.getElementById('hvt-bp-start');
+        const sp = document.getElementById('hvt-bp-stop');
+        if (st) st.style.display = bpRunning ? 'none' : '';
+        if (sp) sp.style.display = bpRunning ? '' : 'none';
+    }
+
+    // ── 生成状态轮询 + 自动下载 ──
+    function bpEnsurePoller() {
+        if (bpPollTimer) return;
+        bpPollTimer = setInterval(bpPollTick, 60_000);
+    }
+    async function bpPollTick() {
+        const watching = bpDb.tasks.filter(t => t.status === '生成中' && t.draftId);
+        if (!watching.length) return;
+        for (const task of watching) {
+            try {
+                const d = await heygenApi(`/v1/pacific/video.get?video_id=${task.draftId}`, { headers: bpSpaceHeaders() });
+                if (d.status === 'completed' && d.video_url) {
+                    task.videoUrl = d.video_url;
+                    task.status = bpDb.settings.autoDownload ? '下载中' : '已完成';
+                    bpSaveDb(); bpRenderTasks();
+                    if (bpDb.settings.autoDownload) bpDownload(task);
+                } else if (d.status === 'failed') {
+                    task.status = '失败';
+                    task.error = d.error_message || '服务端渲染失败';
+                    bpSaveDb(); bpRenderTasks();
+                }
+            } catch (e) { /* 单次轮询失败忽略，下轮再试 */ }
+            await new Promise(r => setTimeout(r, 1200));
+        }
+    }
+    function bpDownload(task) {
+        const safe = (task.title || task.draftId).replace(/[\\/:*?"<>|]/g, '_');
+        chrome.runtime.sendMessage(
+            { type: 'hvt_download', url: task.videoUrl, filename: `${safe}.mp4` },
+            (res) => {
+                task.status = (res && res.ok) ? '已下载' : '已完成';
+                if (!(res && res.ok)) task.error = '自动下载失败，可手动点击下载';
+                bpSaveDb(); bpRenderTasks();
+            }
+        );
+    }
+
+    // 原图上传：JPEG 直接用原始字节；其他格式（PNG/WebP…）按原尺寸转 JPEG
+    // （S3 上传头固定 Content-Type: image/jpeg，与 temp.create 返回的 image.jpg 键一致）
+    function bpPrepareImage(file) {
+        if (file.type === 'image/jpeg') return Promise.resolve(file);
+        return new Promise((resolve, reject) => {
+            const url = URL.createObjectURL(file);
+            const img = new Image();
+            img.onload = () => {
+                URL.revokeObjectURL(url);
+                const canvas = document.createElement('canvas');
+                canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+                canvas.getContext('2d').drawImage(img, 0, 0);
+                canvas.toBlob(b => b ? resolve(b) : reject(new Error('图片转码失败')), 'image/jpeg', 0.95);
+            };
+            img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('无法读取图片')); };
+            img.src = url;
+        });
+    }
+
+    // ── 任务导入：多图 + 文案，按顺序配对 ──
+    // 文案支持三种粘贴格式：
+    //   1. 谷歌表格整行（含制表符）：每行一条，「标题<TAB>文案」或仅「文案」列
+    //   2. 空行分段：一段一条
+    //   3. 单行一条
+    // 返回 [{title?, script}]
+    function bpSplitScripts(raw) {
+        const txt = String(raw || '').replace(/\r/g, '').trim();
+        if (!txt) return [];
+        if (txt.includes('\t')) {
+            return txt.split('\n').map(s => s.trim()).filter(Boolean).map(line => {
+                const cols = line.split('\t').map(c => c.trim()).filter(Boolean);
+                return cols.length >= 2
+                    ? { title: cols[0], script: cols.slice(1).join(' ') }
+                    : { script: cols[0] || '' };
+            });
+        }
+        const blocks = txt.includes('\n\n')
+            ? txt.split(/\n{2,}/).map(s => s.trim()).filter(Boolean)
+            : txt.split('\n').map(s => s.trim()).filter(Boolean);
+        return blocks.map(b => ({ script: b }));
+    }
+    async function bpImportTasks(files, scriptsRaw) {
+        const scripts = bpSplitScripts(scriptsRaw);
+        if (!files.length) { showToast('请选择图片', 'error'); return; }
+        if (scripts.length !== files.length) {
+            showToast(`图片 ${files.length} 张 ≠ 文案 ${scripts.length} 条，请一一对应`, 'error', 4500);
+            return;
+        }
+        for (let i = 0; i < files.length; i++) {
+            const id = `bp_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 7)}`;
+            const baseName = files[i].name.replace(/\.[^.]+$/, '');
+            const blob = await bpPrepareImage(files[i]);   // 原图上传（非 JPEG 才原尺寸转码）
+            await bpIdbPut(id, blob);
+            bpDb.tasks.push({
+                id, title: scripts[i].title || baseName, script: scripts[i].script,
+                voiceId: '', status: '待提交',
+                groupId: '', draftId: '', videoUrl: '', error: '', submittedAt: 0,
+            });
+        }
+        bpSaveDb();
+        bpRenderTasks();
+        bpKick();
+        showToast(`已添加 ${files.length} 个任务`, 'success');
+    }
+
+    // ── UI ──
+    const BP_FINAL_STATES = ['已下载', '已完成', '失败'];
+    const bpThumbCache = new Map();   // taskId → objectURL（避免每次渲染重建）
+    async function bpThumbUrl(taskId) {
+        if (bpThumbCache.has(taskId)) return bpThumbCache.get(taskId);
+        const blob = await bpIdbGet(taskId).catch(() => null);
+        const url = blob ? URL.createObjectURL(blob) : '';
+        bpThumbCache.set(taskId, url);
+        return url;
+    }
+    function bpRenderTasks() {
+        const wrap = document.getElementById('hvt-bp-list');
+        if (!wrap) return;
+        if (!bpDb.tasks.length) {
+            wrap.innerHTML = '<div class="hvt-bp-empty">暂无任务：选择图片并粘贴对应文案后点「添加任务」</div>';
+            return;
+        }
+        const last = bpDb.tasks.length - 1;
+        wrap.innerHTML = bpDb.tasks.map((t, i) => `
+            <div class="hvt-bp-row" data-id="${esc(t.id)}">
+              <span class="hvt-bp-idx">${i + 1}</span>
+              <img class="hvt-bp-thumb" alt="" title="任务头像图">
+              <input class="hvt-bp-t-title hvt-input" value="${esc(t.title)}" title="视频标题">
+              <input class="hvt-bp-t-voice hvt-input" value="${esc(t.voiceId)}" placeholder="声音ID(空=默认)" title="该任务单独的声音 ID，留空用默认">
+              <span class="hvt-bp-t-script" title="${esc(t.script)}">${esc(t.script.slice(0, 40))}${t.script.length > 40 ? '…' : ''}</span>
+              <span class="hvt-bp-swap">
+                <button class="hvt-btn hvt-bp-txt-up" title="文案与上一行调换（图片不动）" ${i === 0 ? 'disabled' : ''}>⇅↑</button>
+                <button class="hvt-btn hvt-bp-txt-down" title="文案与下一行调换（图片不动）" ${i === last ? 'disabled' : ''}>⇅↓</button>
+              </span>
+              <span class="hvt-bp-t-status hvt-bp-st-${t.status === '失败' ? 'err' : (BP_FINAL_STATES.includes(t.status) ? 'ok' : (t.status === '待提交' ? 'idle' : 'busy'))}"
+                    title="${esc(t.error || '')}">${esc(t.status)}${t.error ? ' ⚠' : ''}</span>
+              <span class="hvt-bp-t-ops">
+                ${t.videoUrl ? '<button class="hvt-btn hvt-bp-dl" title="下载视频">⬇</button>' : ''}
+                ${t.status === '失败' ? '<button class="hvt-btn hvt-bp-retry" title="重置为待提交">↺</button>' : ''}
+                <button class="hvt-btn hvt-bp-del" title="删除任务">✕</button>
+              </span>
+            </div>`).join('');
+        // 缩略图异步填充（IndexedDB → objectURL）
+        wrap.querySelectorAll('.hvt-bp-row').forEach(row => {
+            bpThumbUrl(row.dataset.id).then(url => {
+                const img = row.querySelector('.hvt-bp-thumb');
+                if (img && url) img.src = url;
+            });
+        });
+    }
+    // 文案（含标题/声音ID）与相邻行调换，图片和已建头像保持原位
+    function bpSwapScript(task, dir) {
+        const i = bpDb.tasks.indexOf(task);
+        const j = i + dir;
+        if (j < 0 || j >= bpDb.tasks.length) return;
+        const other = bpDb.tasks[j];
+        const busy = (t) => !['待提交', '失败'].includes(t.status);
+        if (busy(task) || busy(other)) { showToast('已提交的任务不能调换文案', 'error'); return; }
+        for (const k of ['title', 'script', 'voiceId']) {
+            [task[k], other[k]] = [other[k], task[k]];
+        }
+        bpSaveDb(); bpRenderTasks();
+    }
+    function bpSyncSettingsFromUI() {
+        const g = (id) => document.getElementById(id);
+        bpDb.settings.spaceId     = g('hvt-bp-space').value;
+        bpDb.settings.voiceId     = g('hvt-bp-voice').value.trim();
+        bpDb.settings.orientation = g('hvt-bp-orient').value;
+        bpDb.settings.resolution  = g('hvt-bp-res').value;
+        bpDb.settings.forceIII    = g('hvt-bp-force3').checked;
+        bpDb.settings.intervalMin = Math.max(0, parseFloat(g('hvt-bp-int-min').value) || 0);
+        bpDb.settings.intervalMax = Math.max(bpDb.settings.intervalMin, parseFloat(g('hvt-bp-int-max').value) || 0);
+        bpDb.settings.hourlyCap   = Math.max(1, parseInt(g('hvt-bp-cap').value, 10) || 10);
+        bpDb.settings.scheduleAt  = g('hvt-bp-schedule').value;
+        bpDb.settings.autoDownload = g('hvt-bp-autodl').checked;
+        bpSaveDb();
+    }
+    function bpFillSettingsUI() {
+        const s = bpDb.settings;
+        const g = (id) => document.getElementById(id);
+        g('hvt-bp-space').value   = s.spaceId;
+        g('hvt-bp-voice').value   = s.voiceId;
+        g('hvt-bp-orient').value  = s.orientation;
+        g('hvt-bp-res').value     = s.resolution;
+        g('hvt-bp-force3').checked = s.forceIII;
+        g('hvt-bp-int-min').value = s.intervalMin;
+        g('hvt-bp-int-max').value = s.intervalMax;
+        g('hvt-bp-cap').value     = s.hourlyCap;
+        g('hvt-bp-schedule').value = s.scheduleAt;
+        g('hvt-bp-autodl').checked = s.autoDownload;
+    }
+    // Space 下拉：异步拉取团队空间列表填充；无已选值时默认第一个团队 Space
+    async function bpPopulateSpaces() {
+        const sel = document.getElementById('hvt-bp-space');
+        if (!sel || sel.dataset.loaded) return;
+        try {
+            const spaces = await fetchSpaces();
+            for (const sp of spaces) {
+                const opt = document.createElement('option');
+                opt.value = sp.id; opt.textContent = sp.name;
+                sel.appendChild(opt);
+            }
+            sel.dataset.loaded = '1';
+            if (!bpDb.settings.spaceId && spaces.length) {
+                bpDb.settings.spaceId = spaces[0].id;
+                bpSaveDb();
+            }
+            sel.value = bpDb.settings.spaceId;
+        } catch { /* 拉取失败保持「个人」 */ }
+    }
+
+    function bpBuildUI() {
+        const root = document.createElement('div');
+        root.id = 'hvt-bp-overlay';
+        root.style.display = 'none';
+        root.innerHTML = `
+            <div id="hvt-bp-panel">
+              <div id="hvt-bp-header">
+                <span>🎬 批量流水线（免 UI 提交视频）</span>
+                <button id="hvt-bp-close" title="关闭">✕</button>
+              </div>
+              <div id="hvt-bp-body">
+                <div class="hvt-bp-section">
+                  <div class="hvt-bp-sec-title">① 默认参数（走 Avatar Shots 通道，Avatar III 不占用生成额度）</div>
+                  <div class="hvt-bp-line">
+                    <label>Space
+                      <select id="hvt-bp-space" class="hvt-input"><option value="">个人</option></select>
+                    </label>
+                    <label>声音ID <input id="hvt-bp-voice" class="hvt-input" placeholder="默认 voice_id"></label>
+                    <label>画幅
+                      <select id="hvt-bp-orient" class="hvt-input">
+                        <option value="portrait">竖屏 9:16</option>
+                        <option value="landscape">横屏 16:9</option>
+                      </select>
+                    </label>
+                    <label>分辨率
+                      <select id="hvt-bp-res" class="hvt-input">
+                        <option value="720p">720p</option>
+                        <option value="1080p">1080p</option>
+                      </select>
+                    </label>
+                    <label title="Avatar III + 无限模式（不占额度）；取消则用 Avatar IV"><input type="checkbox" id="hvt-bp-force3"> Avatar III</label>
+                    <label><input type="checkbox" id="hvt-bp-autodl"> 完成后自动下载</label>
+                  </div>
+                </div>
+                <div class="hvt-bp-section">
+                  <div class="hvt-bp-sec-title">② 添加任务（图片按文件名排序，与文案按顺序一一配对）</div>
+                  <div class="hvt-bp-line">
+                    <input type="file" id="hvt-bp-imgs" accept="image/*" multiple>
+                  </div>
+                  <div id="hvt-bp-img-strip" style="display:none"></div>
+                  <textarea id="hvt-bp-scripts" placeholder="粘贴文案，条数须与图片数一致。支持：&#10;· 谷歌表格整行粘贴（每行一条；两列时第 1 列作标题、第 2 列作文案）&#10;· 空行分段 / 每行一条"></textarea>
+                  <div class="hvt-bp-line">
+                    <button id="hvt-bp-add" class="hvt-btn hvt-btn-primary">添加任务</button>
+                  </div>
+                </div>
+                <div class="hvt-bp-section">
+                  <div class="hvt-bp-sec-title">③ 提交控制</div>
+                  <div class="hvt-bp-line">
+                    <label>间隔(分) <input id="hvt-bp-int-min" class="hvt-input hvt-bp-num" type="number" min="0" step="0.5">
+                      ~ <input id="hvt-bp-int-max" class="hvt-input hvt-bp-num" type="number" min="0" step="0.5"></label>
+                    <label>每小时上限 <input id="hvt-bp-cap" class="hvt-input hvt-bp-num" type="number" min="1" step="1"></label>
+                    <label>定时启动 <input id="hvt-bp-schedule" class="hvt-input" type="datetime-local"></label>
+                    <button id="hvt-bp-start" class="hvt-btn hvt-btn-primary">▶ 开始</button>
+                    <button id="hvt-bp-stop" class="hvt-btn hvt-btn-danger" style="display:none">■ 暂停</button>
+                  </div>
+                  <div id="hvt-bp-status"></div>
+                  <div class="hvt-bp-note">⚠ 提交与轮询依赖本页面：请保持任意 HeyGen 标签页开启。关闭后重开会自动续跑。</div>
+                </div>
+                <div class="hvt-bp-section">
+                  <div class="hvt-bp-sec-title">④ 任务队列</div>
+                  <div id="hvt-bp-list"></div>
+                </div>
+              </div>
+            </div>`;
+        document.body.appendChild(root);
+
+        const g = (id) => document.getElementById(id);
+        g('hvt-bp-close').addEventListener('click', () => { root.style.display = 'none'; });
+        root.addEventListener('click', (e) => { if (e.target === root) root.style.display = 'none'; });
+
+        ['hvt-bp-space', 'hvt-bp-voice', 'hvt-bp-orient', 'hvt-bp-res', 'hvt-bp-force3', 'hvt-bp-autodl',
+         'hvt-bp-int-min', 'hvt-bp-int-max', 'hvt-bp-cap', 'hvt-bp-schedule']
+            .forEach(id => g(id).addEventListener('change', bpSyncSettingsFromUI));
+
+        // 选图后立即显示顺序预览条，便于与文案顺序核对
+        g('hvt-bp-imgs').addEventListener('change', () => {
+            const strip = g('hvt-bp-img-strip');
+            strip.querySelectorAll('img').forEach(im => URL.revokeObjectURL(im.src));
+            const files = [...g('hvt-bp-imgs').files].sort((a, b) => a.name.localeCompare(b.name));
+            if (!files.length) { strip.style.display = 'none'; strip.innerHTML = ''; return; }
+            strip.style.display = '';
+            strip.innerHTML = files.map((f, i) =>
+                `<span class="hvt-bp-strip-item"><span class="hvt-bp-strip-idx">${i + 1}</span><img alt=""><span class="hvt-bp-strip-name">${esc(f.name)}</span></span>`
+            ).join('');
+            strip.querySelectorAll('img').forEach((im, i) => { im.src = URL.createObjectURL(files[i]); });
+        });
+
+        g('hvt-bp-add').addEventListener('click', async () => {
+            const files = [...g('hvt-bp-imgs').files].sort((a, b) => a.name.localeCompare(b.name));
+            await bpImportTasks(files, g('hvt-bp-scripts').value);
+            g('hvt-bp-imgs').value = '';
+            const strip = g('hvt-bp-img-strip');
+            strip.querySelectorAll('img').forEach(im => URL.revokeObjectURL(im.src));
+            strip.style.display = 'none'; strip.innerHTML = '';
+        });
+
+        g('hvt-bp-start').addEventListener('click', () => { bpSyncSettingsFromUI(); bpStart(); });
+        g('hvt-bp-stop').addEventListener('click', bpStop);
+
+        g('hvt-bp-list').addEventListener('click', async (e) => {
+            const row = e.target.closest('.hvt-bp-row');
+            if (!row) return;
+            const task = bpDb.tasks.find(t => t.id === row.dataset.id);
+            if (!task) return;
+            if (e.target.classList.contains('hvt-bp-del')) {
+                if (task.id === bpCurrentTask) { showToast('该任务正在执行，无法删除', 'error'); return; }
+                bpDb.tasks = bpDb.tasks.filter(t => t.id !== task.id);
+                await bpIdbDel(task.id);
+                const thumb = bpThumbCache.get(task.id);
+                if (thumb) { URL.revokeObjectURL(thumb); bpThumbCache.delete(task.id); }
+                bpSaveDb(); bpRenderTasks();
+            } else if (e.target.classList.contains('hvt-bp-retry')) {
+                task.status = '待提交'; task.error = '';
+                bpSaveDb(); bpRenderTasks(); bpKick();
+            } else if (e.target.classList.contains('hvt-bp-dl')) {
+                bpDownload(task);
+            } else if (e.target.classList.contains('hvt-bp-txt-up')) {
+                bpSwapScript(task, -1);
+            } else if (e.target.classList.contains('hvt-bp-txt-down')) {
+                bpSwapScript(task, 1);
+            }
+        });
+        g('hvt-bp-list').addEventListener('change', (e) => {
+            const row = e.target.closest('.hvt-bp-row');
+            if (!row) return;
+            const task = bpDb.tasks.find(t => t.id === row.dataset.id);
+            if (!task) return;
+            if (e.target.classList.contains('hvt-bp-t-title')) task.title = e.target.value.trim();
+            if (e.target.classList.contains('hvt-bp-t-voice')) task.voiceId = e.target.value.trim();
+            bpSaveDb();
+        });
+    }
+
+    function bpOpenPanel() {
+        const root = document.getElementById('hvt-bp-overlay');
+        bpFillSettingsUI();
+        bpPopulateSpaces();
+        bpRenderTasks();
+        bpUpdateRunButtons();
+        root.style.display = 'flex';
+    }
+
+    function bpInit() {
+        bpLoadDb();
+        bpBuildUI();
+        // 中断恢复：上次处于运行态 → 自动续跑；卡在中间态的任务重置
+        for (const t of bpDb.tasks) {
+            if (['创建头像中', '构建草稿中', '提交渲染中', '下载中'].includes(t.status)) {
+                t.status = t.draftId ? '生成中' : '待提交';
+            }
+        }
+        bpSaveDb();
+        if (bpDb.tasks.some(t => t.status === '生成中')) bpEnsurePoller();
+        if (bpDb.running) { bpDb.running = false; bpStart(); }
+    }
+
     // ─── Build UI ─────────────────────────────────────────────────────────────
     function buildUI() {
         const fabStrip = document.createElement('div');
@@ -3900,6 +4514,13 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             <div class="hvt-fab-divider"></div>
             <button id="hvt-fab-eng" title="强制 Avatar III 引擎：Avatar IV / V 自动切回 III">
                 <span class="hvt-fab-eng-txt">III</span>
+            </button>
+            <div class="hvt-fab-divider"></div>
+            <button id="hvt-fab-bp" title="批量流水线：免 UI 批量提交视频并自动下载">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="2" y="4" width="20" height="16" rx="2"/>
+                    <path d="m10 9 5 3-5 3z"/>
+                </svg>
             </button>
         `;
         document.body.appendChild(fabStrip);
@@ -4369,6 +4990,8 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         document.getElementById('hvt-fab-vd').addEventListener('click', () => {
             openVoiceDesign();
         });
+
+        document.getElementById('hvt-fab-bp').addEventListener('click', bpOpenPanel);
 
         const engBtn = document.getElementById('hvt-fab-eng');
         engBtn.classList.toggle('hvt-fab-off', !forceIIIEnabled());
@@ -5011,6 +5634,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         initUpdateCheck();                 // 检查 GitHub 是否有新版本并提示升级
         spaceInit();                       // 加载社区声音缓存并后台慢速刷新
         initEngineForce();                 // Avatar IV 自动切回 Avatar III
+        bpInit();                          // 批量流水线：恢复队列并按需续跑
         setTimeout(expAutoCleanRun, 8000); // 若已开启自动清理，加载后在后台执行
     }
 
