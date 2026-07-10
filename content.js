@@ -1090,8 +1090,10 @@
                 <td class="c-flag" title="${esc(localeCode)}（双击复制）" data-copy="${esc(localeCode)}">${flag} <span class="c-flag-code">${esc(localeCode)}</span></td>
                 <td class="c-gender"><span class="${genderClass}">${genderIcon}</span></td>
                 <td class="c-name" title="${statusTitle}" data-copy="${esc((v.display_name || '') + '/' + (v.voice_id || ''))}">
-                    <div class="hvt-name-main">${esc(v.display_name || '—')}</div>
-                    <button class="hvt-copy-id-btn" data-copy="${esc((v.display_name || '') + '/' + (v.voice_id || ''))}" title="复制 名称/ID">${esc(shortId)}</button>
+                    <div class="hvt-name-line">
+                        <span class="hvt-name-main">${esc(v.display_name || '—')}</span>
+                        <button class="hvt-copy-id-btn" data-copy="${esc((v.display_name || '') + '/' + (v.voice_id || ''))}" title="复制 名称/ID">${esc(shortId)}</button>
+                    </div>
                 </td>
                 <td class="c-tags" title="双击复制标签">${tagsHtml}</td>
                 <td class="c-notes">
@@ -1254,19 +1256,25 @@
     // 依次为每个提示词调 voice_design/create，返回分组结果（每组通常 3 个声音选项）
     async function vdCreateVoices(promptItems, statusEl) {
         const groups = [];
+        let lastErr = null;
         for (let i = 0; i < promptItems.length; i++) {
             const it = promptItems[i];
             if (statusEl && promptItems.length > 1) {
                 statusEl.textContent = `⏳ 生成中 ${i + 1}/${promptItems.length}（${it.label}）…`;
             }
-            const data = await heygenApi('/v1/voice/voice_design/create', {
-                method: 'POST',
-                body: JSON.stringify({ name: 'Voice', prompt: it.prompt, prefer_stream: true }),
-            });
-            const { request_id, options } = data;
-            if (options && options.length) groups.push({ label: it.label, request_id, options });
+            try {
+                const data = await heygenApi('/v1/voice/voice_design/create', {
+                    method: 'POST',
+                    body: JSON.stringify({ name: 'Voice', prompt: it.prompt, prefer_stream: true }),
+                });
+                const { request_id, options } = data;
+                if (options && options.length) groups.push({ label: it.label, request_id, options });
+            } catch (e) {
+                lastErr = e; // 某组失败不丢弃已生成的组
+                showToast(`${it.label || '生成'}失败: ${e.message}`, 'error', 3000);
+            }
         }
-        if (!groups.length) throw new Error('未返回声音选项');
+        if (!groups.length) throw new Error(lastErr ? lastErr.message : '未返回声音选项');
         return groups;
     }
 
@@ -1347,8 +1355,12 @@
         if (vdAudioEl) { vdAudioEl.pause(); vdAudioEl = null; }
 
         try {
-            const groups = await vdCreateVoices([{ label: '', prompt }], statusEl);
+            const nGroups = Number(document.getElementById('hvt-vd-count').value) || 1;
+            const items = Array.from({ length: nGroups }, (_, i) =>
+                ({ label: nGroups > 1 ? `第 ${i + 1} 组` : '', prompt }));
+            const groups = await vdCreateVoices(items, statusEl);
             vdRenderOptionGroups(groups);
+            if (nGroups > 1) statusEl.textContent = `✅ 共生成 ${groups.reduce((n, g) => n + g.options.length, 0)} 个试听`;
         } catch (e) {
             statusEl.textContent = '生成失败: ' + e.message;
             showToast('生成失败: ' + e.message, 'error', 4000);
@@ -1545,7 +1557,16 @@
 
     // ─── Gemini 引擎：多图 → 3 个声音设计提示词方案 ─────────────────────────────
     const GM_STORE_KEY     = 'hvt_gm_settings';
-    const GM_DEFAULT_MODEL = 'gemini-2.5-flash';
+    const GM_DEFAULT_MODEL = 'gemini-3.5-flash';
+    // 保底白名单（2026-07 核对；2.0 系列已关停）。填了 API Key 后会从 models.list 动态拉取覆盖
+    const GM_MODELS = ['gemini-3.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+    const GM_MODELS_CACHE_KEY = 'hvt_gm_models_cache';
+    const GM_MODELS_CACHE_TTL = 24 * 3600 * 1000;
+    // OpenRouter 备用服务商（Gemini 限流/不可用时切换）。免费模型池波动大，刷新按钮实时拉取
+    const OR_DEFAULT_MODEL = 'google/gemma-4-31b-it:free';
+    // 保底白名单（2026-07 从 openrouter.ai/api/v1/models 核对：免费+支持图片输入）
+    const OR_MODELS = ['google/gemma-4-31b-it:free', 'google/gemma-4-26b-a4b-it:free', 'nvidia/nemotron-nano-12b-v2-vl:free'];
+    const OR_MODELS_CACHE_KEY = 'hvt_or_models_cache';
     const GM_MAX_IMAGES    = 6;
     // 默认系统指令（框架版，待精调）。用户在设置里改过则以 storage 为准。
     const GM_DEFAULT_SYS_PROMPT = `You are an expert American English voice casting director with deep specialization in Christian faith-based media. You have 20+ years of experience in US religious broadcasting, church media production, and audio content for American Christian audiences across all denominations.
@@ -1614,28 +1635,146 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     function gmGetSettings() {
         let s = {};
         try { s = JSON.parse(localStorage.getItem(GM_STORE_KEY)) || {}; } catch {}
+        // 旧版本是自由文本输入，可能存了非法/已关停的模型名 → 回退默认
+        const model = String(s.model || '').trim().replace(/^models\//, '');
+        const known = gmKnownModels();
+        const orModel = String(s.orModel || '').trim();
+        const orKnown = orKnownModels();
         return {
+            provider:  s.provider === 'openrouter' ? 'openrouter' : 'gemini',
             apiKey:    s.apiKey || '',
-            model:     s.model || GM_DEFAULT_MODEL,
+            model:     known.includes(model) ? model : (known.includes(GM_DEFAULT_MODEL) ? GM_DEFAULT_MODEL : known[0]),
+            orApiKey:  s.orApiKey || '',
+            orModel:   orKnown.includes(orModel) ? orModel : (orKnown.includes(OR_DEFAULT_MODEL) ? OR_DEFAULT_MODEL : orKnown[0]),
             sysPrompt: s.sysPrompt || GM_DEFAULT_SYS_PROMPT,
         };
     }
 
+    // 动态模型列表：有效缓存 > 保底白名单
+    function gmCachedModels(ignoreTtl, cacheKey) {
+        try {
+            const c = JSON.parse(localStorage.getItem(cacheKey || GM_MODELS_CACHE_KEY));
+            if (c && Array.isArray(c.models) && c.models.length &&
+                (ignoreTtl || Date.now() - c.ts < GM_MODELS_CACHE_TTL)) return c.models;
+        } catch {}
+        return null;
+    }
+
+    function gmKnownModels() {
+        return gmCachedModels(true) || GM_MODELS;
+    }
+
+    function orKnownModels() {
+        return gmCachedModels(true, OR_MODELS_CACHE_KEY) || OR_MODELS;
+    }
+
+    // 设置面板里当前选中的服务商（未保存也生效，便于切换预览）
+    function gmUIProvider() {
+        const sel = document.getElementById('hvt-gm-provider');
+        return sel && sel.value === 'openrouter' ? 'openrouter' : 'gemini';
+    }
+
+    function gmPopulateModelSelect(selected, provider) {
+        const sel = document.getElementById('hvt-gm-model');
+        const or = provider === 'openrouter';
+        const models = or ? orKnownModels() : gmKnownModels();
+        const def = or ? OR_DEFAULT_MODEL : GM_DEFAULT_MODEL;
+        sel.innerHTML = models.map(id =>
+            `<option value="${id}">${id}${id === def ? '（推荐）' : ''}</option>`).join('');
+        sel.value = models.includes(selected) ? selected : (models.includes(def) ? def : models[0]);
+    }
+
+    // 拉取当前服务商支持图片对话的模型，写入缓存并刷新下拉框
+    // Gemini：models.list 需 API Key；OpenRouter：公开接口免 Key，只留免费+图片输入模型
+    async function gmRefreshModels(force) {
+        const st = gmGetSettings();
+        const provider = gmUIProvider();
+        const btn = document.getElementById('hvt-gm-models-refresh');
+        if (provider === 'openrouter') {
+            if (!force && gmCachedModels(false, OR_MODELS_CACHE_KEY)) return; // 缓存未过期
+            btn.disabled = true;
+            try {
+                const resp = await chrome.runtime.sendMessage({ type: 'hvt_or_list_models' });
+                if (!resp || !resp.ok) throw new Error((resp && resp.error) || '无响应');
+                let models = resp.models
+                    .filter(m => m.free && m.image && m.text)
+                    .map(m => m.id)
+                    .sort();
+                if (!models.length) throw new Error('未过滤出免费图片模型');
+                // 节点健康度：剔除所有托管节点都宕机的模型，其余按在线率降序（未知视为 50 分排中间）
+                const hr = await chrome.runtime.sendMessage({ type: 'hvt_or_models_health', ids: models });
+                if (hr && hr.ok) {
+                    const score = id => hr.uptime[id] === null ? 50 : hr.uptime[id];
+                    const healthy = models.filter(id => score(id) > 0);
+                    if (healthy.length) models = healthy.sort((a, b) => score(b) - score(a) || a.localeCompare(b));
+                }
+                try { localStorage.setItem(OR_MODELS_CACHE_KEY, JSON.stringify({ models, ts: Date.now() })); } catch {}
+                gmPopulateModelSelect(document.getElementById('hvt-gm-model').value, 'openrouter');
+                if (force) showToast(`✅ 已同步 ${models.length} 个免费图片模型`, 'success');
+            } catch (e) {
+                if (force) showToast('拉取模型列表失败: ' + e.message, 'error', 4000);
+            } finally {
+                btn.disabled = false;
+            }
+            return;
+        }
+        if (!st.apiKey) { if (force) showToast('请先填写 API Key 再刷新列表', 'error'); return; }
+        if (!force && gmCachedModels(false)) return; // 缓存未过期
+        btn.disabled = true;
+        try {
+            const resp = await chrome.runtime.sendMessage({ type: 'hvt_gemini_list_models', apiKey: st.apiKey });
+            if (!resp || !resp.ok) throw new Error((resp && resp.error) || '无响应');
+            const models = resp.models
+                .filter(m => m.methods.includes('generateContent'))
+                .filter(m => /^gemini-/.test(m.id))
+                .filter(m => !/image|tts|live|embedding|audio|robotics|computer-use/.test(m.id))
+                .map(m => m.id)
+                .sort().reverse(); // 版本高的排前面
+            if (!models.length) throw new Error('未过滤出可用模型');
+            try { localStorage.setItem(GM_MODELS_CACHE_KEY, JSON.stringify({ models, ts: Date.now() })); } catch {}
+            gmPopulateModelSelect(document.getElementById('hvt-gm-model').value, 'gemini');
+            if (force) showToast(`✅ 已同步 ${models.length} 个可用模型`, 'success');
+        } catch (e) {
+            if (force) showToast('拉取模型列表失败: ' + e.message, 'error', 4000);
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    // 按服务商切换 Key 输入框/获取链接的显隐，并重灌模型下拉框
+    function gmProviderUI() {
+        const st = gmGetSettings();
+        const or = gmUIProvider() === 'openrouter';
+        document.getElementById('hvt-gm-key-row').style.display  = or ? 'none' : '';
+        document.getElementById('hvt-or-key-row').style.display  = or ? '' : 'none';
+        document.getElementById('hvt-gm-key-link').style.display = or ? 'none' : '';
+        document.getElementById('hvt-or-key-link').style.display = or ? '' : 'none';
+        gmPopulateModelSelect(or ? st.orModel : st.model, or ? 'openrouter' : 'gemini');
+    }
+
     function gmLoadSettingsUI() {
         const st = gmGetSettings();
+        document.getElementById('hvt-gm-provider').value = st.provider;
         document.getElementById('hvt-gm-key').value   = st.apiKey;
-        document.getElementById('hvt-gm-model').value = st.model;
+        document.getElementById('hvt-or-key').value   = st.orApiKey;
+        gmProviderUI();
         document.getElementById('hvt-gm-sys').value   = st.sysPrompt;
     }
 
     function gmSaveSettings() {
+        const prev = gmGetSettings();
+        const or = gmUIProvider() === 'openrouter';
+        const modelSel = document.getElementById('hvt-gm-model').value;
         const s = {
+            provider:  or ? 'openrouter' : 'gemini',
             apiKey:    document.getElementById('hvt-gm-key').value.trim(),
-            model:     document.getElementById('hvt-gm-model').value.trim() || GM_DEFAULT_MODEL,
+            orApiKey:  document.getElementById('hvt-or-key').value.trim(),
+            model:     or ? prev.model : (modelSel || GM_DEFAULT_MODEL),
+            orModel:   or ? (modelSel || OR_DEFAULT_MODEL) : prev.orModel,
             sysPrompt: document.getElementById('hvt-gm-sys').value.trim() || GM_DEFAULT_SYS_PROMPT,
         };
         try { localStorage.setItem(GM_STORE_KEY, JSON.stringify(s)); } catch {}
-        showToast('✅ Gemini 设置已保存', 'success');
+        showToast('✅ AI 分析设置已保存', 'success');
     }
 
     function gmBlobToBase64(blob) {
@@ -1682,30 +1821,46 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         return m;
     }
 
+    let gmAnalyzeReq = null; // 进行中的分析请求 id；分析期间再点按钮 = 中止
+
     async function gmAnalyze() {
+        const btn      = document.getElementById('hvt-gm-analyze');
+        const statusEl = document.getElementById('hvt-gm-status');
+        if (gmAnalyzeReq) { // 中止进行中的请求
+            chrome.runtime.sendMessage({ type: 'hvt_ai_abort', reqId: gmAnalyzeReq });
+            gmAnalyzeReq = null;
+            btn.textContent = '🔮 分析生成提示词';
+            statusEl.textContent = '已中止';
+            statusEl.className = '';
+            return;
+        }
         const st = gmGetSettings();
-        if (!st.apiKey) {
+        const or = st.provider === 'openrouter';
+        const provName = or ? 'OpenRouter' : 'Gemini';
+        if (!(or ? st.orApiKey : st.apiKey)) {
             document.getElementById('hvt-gm-settings').style.display = '';
-            showToast('请先填写 Gemini API Key（aistudio.google.com 免费获取）', 'error', 4000);
+            showToast(or ? '请先填写 OpenRouter API Key（openrouter.ai 免费获取）'
+                         : '请先填写 Gemini API Key（aistudio.google.com 免费获取）', 'error', 4000);
             return;
         }
         if (!gmImages.length) { showToast('请先添加至少一张人物图片', 'error'); return; }
 
-        const btn      = document.getElementById('hvt-gm-analyze');
-        const statusEl = document.getElementById('hvt-gm-status');
         const resultEl = document.getElementById('hvt-gm-result');
-        btn.disabled = true;
-        btn.textContent = '⏳ 分析中…';
+        const reqId = 'gm-' + Date.now();
+        gmAnalyzeReq = reqId;
+        btn.textContent = '⏳ 分析中…点此中止';
         statusEl.textContent = '';
         try {
             const resp = await chrome.runtime.sendMessage({
-                type: 'hvt_gemini_generate',
-                apiKey: st.apiKey,
-                model: st.model,
+                type: or ? 'hvt_or_generate' : 'hvt_gemini_generate',
+                reqId,
+                apiKey: or ? st.orApiKey : st.apiKey,
+                model: or ? st.orModel : st.model,
                 systemPrompt: st.sysPrompt,
                 images: gmImages,
                 userNote: document.getElementById('hvt-gm-note').value.trim(),
             });
+            if (gmAnalyzeReq !== reqId) return; // 用户已中止，忽略迟到结果
             if (!resp || !resp.ok) throw new Error((resp && resp.error) || '无响应');
             const prompts = gmParsePrompts(resp.text);
             document.getElementById('hvt-gm-analysis-text').textContent = resp.text;
@@ -1719,12 +1874,15 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             statusEl.textContent = `✅ 已生成 ${prompts.length} 个方案，勾选后点「生成所选声音」`;
             statusEl.className = 'hvt-vd-photo-ok';
         } catch (e) {
+            if (gmAnalyzeReq !== reqId) return;
             statusEl.textContent = '分析失败: ' + e.message;
             statusEl.className = 'hvt-vd-photo-err';
-            showToast('Gemini 分析失败: ' + e.message, 'error', 4000);
+            showToast(provName + ' 分析失败: ' + e.message, 'error', 4000);
         } finally {
-            btn.disabled = false;
-            btn.textContent = '🔮 分析生成提示词';
+            if (gmAnalyzeReq === reqId) {
+                gmAnalyzeReq = null;
+                btn.textContent = '🔮 分析生成提示词';
+            }
         }
     }
 
@@ -2236,6 +2394,48 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         }
     }
 
+    // 试听音频长期缓存（IndexedDB，key = voice_id，value = mp3 Blob）
+    const MV_AUDIO_DB = 'hvt_audio_cache';
+    function mvAudioDbOpen() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open(MV_AUDIO_DB, 1);
+            req.onupgradeneeded = () => req.result.createObjectStore('audio');
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+    async function mvAudioGet(id) {
+        try {
+            const db = await mvAudioDbOpen();
+            return await new Promise((resolve) => {
+                const req = db.transaction('audio').objectStore('audio').get(id);
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => resolve(null);
+            });
+        } catch { return null; }
+    }
+    async function mvAudioPut(id, blob) {
+        try {
+            const db = await mvAudioDbOpen();
+            db.transaction('audio', 'readwrite').objectStore('audio').put(blob, id);
+        } catch {}
+    }
+    async function mvAudioClearAll() {
+        try {
+            const db = await mvAudioDbOpen();
+            const store = db.transaction('audio', 'readwrite').objectStore('audio');
+            const n = await new Promise((resolve) => {
+                const req = store.count();
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => resolve(0);
+            });
+            store.clear();
+            showToast(`✅ 已清空 ${n} 条试听缓存，下次试听将重新加载`, 'success', 2500);
+        } catch (e) {
+            showToast('清空失败: ' + e.message, 'error');
+        }
+    }
+
     // Stream preview audio from HeyGen API → Uint8Array of MP3 bytes
     // Endpoint: POST /v2/online/voice.stream_preview  body: {voice_id, language}
     // Response: application/x-ndjson, each line = {audio_bytes: base64} | heartbeat
@@ -2277,17 +2477,21 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         return combined;
     }
 
-    async function mvTogglePlay(v) {
+    async function mvTogglePlay(v, force) {
         const id = v.voice_id;
         if (mvPlayingId === id) { mvStopAudio(); return; }
         mvStopAudio();
         const btn = document.querySelector(`.hvt-mv-play-btn[data-mv-id="${CSS.escape(id)}"]`);
         if (btn) { btn.dataset.loading = '1'; btn.disabled = true; delete btn.dataset.errored; }
         try {
-            if (!myUsername) myUsername = await expGetMyUsername();
-            const spaceId = v._space || myUsername;
-            const audioBytes = await mvStreamPreview(id, v.language || 'English', spaceId);
-            const blob = new Blob([audioBytes], { type: 'audio/mpeg' });
+            let blob = force ? null : await mvAudioGet(id);
+            if (!blob) {
+                if (!myUsername) myUsername = await expGetMyUsername();
+                const spaceId = v._space || myUsername;
+                const audioBytes = await mvStreamPreview(id, v.language || 'English', spaceId);
+                blob = new Blob([audioBytes], { type: 'audio/mpeg' });
+                mvAudioPut(id, blob);
+            }
             const blobUrl = URL.createObjectURL(blob);
             mvPlayingId = id;
             if (btn) { btn.dataset.loading = ''; btn.dataset.playing = '1'; btn.disabled = false; }
@@ -2468,6 +2672,81 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     function mvActiveVoices() { return mvViewMode === 'space' ? spaceVoices : mvVoices; }
     function mvActiveSel()    { return mvViewMode === 'space' ? spaceSelectedIds : mvSelectedIds; }
 
+    // 名称/ID 交互：单击复制、名称双击改名（替代原来的复制小按钮）
+    function mvBindCopyRename(row, v, canRename, persist) {
+        const nameEl = row.querySelector('.hvt-mv-name');
+        const idEl = row.querySelector('.hvt-mv-id');
+        idEl.addEventListener('click', () => {
+            navigator.clipboard.writeText(v.voice_id || '').then(() => showToast('✅ 已复制 Voice ID', 'success', 1500));
+        });
+        let clickTimer = null; // 延迟单击，给双击让路
+        nameEl.addEventListener('click', () => {
+            if (nameEl.dataset.editing) return;
+            clearTimeout(clickTimer);
+            clickTimer = setTimeout(() => {
+                navigator.clipboard.writeText(v.display_name || v.voice_id || '').then(() => showToast('✅ 已复制名称', 'success', 1500));
+            }, 280);
+        });
+        nameEl.addEventListener('dblclick', () => {
+            clearTimeout(clickTimer);
+            if (!canRename) { showToast('只能改名自己创建的声音', 'error'); return; }
+            mvStartRename(nameEl, v, persist);
+        });
+    }
+
+    function mvStartRename(nameEl, v, persist) {
+        if (nameEl.dataset.editing) return;
+        nameEl.dataset.editing = '1';
+        const old = v.display_name || v.voice_id || '';
+        const input = document.createElement('input');
+        input.className = 'hvt-mv-rename-input';
+        input.value = v.display_name || '';
+        nameEl.replaceChildren(input);
+        input.focus();
+        input.select();
+        let done = false;
+        const finish = async (save) => {
+            if (done) return;
+            done = true;
+            const newName = input.value.trim();
+            if (!save || !newName || newName === v.display_name) {
+                delete nameEl.dataset.editing;
+                nameEl.textContent = old;
+                return;
+            }
+            nameEl.textContent = '保存中…';
+            try {
+                await heygenApi('/v1/voice/rename', {
+                    method: 'POST',
+                    body: JSON.stringify({ voice_id: v.voice_id, display_name: newName }),
+                });
+                v.display_name = newName;
+                nameEl.textContent = newName;
+                nameEl.title = `${newName}（单击复制 · 双击改名）`;
+                persist();
+                showToast('✅ 已改名', 'success');
+            } catch (e) {
+                nameEl.textContent = old;
+                showToast('改名失败: ' + e.message, 'error', 4000);
+            } finally {
+                delete nameEl.dataset.editing;
+            }
+        };
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') finish(true);
+            else if (e.key === 'Escape') finish(false);
+        });
+        input.addEventListener('blur', () => finish(true));
+    }
+
+    function mvPersistCache() {
+        try { localStorage.setItem(MV_CACHE_KEY, JSON.stringify({ ts: Date.now(), voices: mvVoices })); } catch {}
+    }
+
+    function spacePersistCache() {
+        try { localStorage.setItem(SPACE_CACHE_KEY, JSON.stringify({ ts: Date.now(), voices: spaceVoices, members: [...spaceMembers] })); } catch {}
+    }
+
     function mvRenderList() {
         if (mvViewMode === 'space') return spaceRenderList();
         const listEl = document.getElementById('hvt-mv-list');
@@ -2501,19 +2780,17 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             row.className = 'hvt-mv-row';
             row.innerHTML = `
                 <input type="checkbox" class="hvt-mv-chk" title="选择下载">
-                <button class="hvt-mv-play-btn" data-mv-id="${esc(id)}" title="试听（需几秒加载）">
+                <button class="hvt-mv-play-btn" data-mv-id="${esc(id)}" title="试听（首次加载后长期缓存；Shift+点击强制重新加载）">
                     <svg class="ic-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/></svg>
                     <svg class="ic-stop" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>
                     <svg class="ic-spin" viewBox="0 0 24 24" style="display:none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2.5" fill="none" stroke-dasharray="28" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/></circle></svg>
                 </button>
-                <span class="hvt-mv-name" title="${esc(name)}">${esc(name)}</span>
-                <button class="hvt-mv-name-copy-btn" title="复制名称">📋</button>
-                ${genderIcon ? `<span class="hvt-mv-gender ${gender === 'female' ? 'hvt-f' : 'hvt-m'}">${genderIcon}</span>` : ''}
+                <span class="hvt-mv-name" title="${esc(name)}（单击复制 · 双击改名）">${esc(name)}</span>
+                <span class="hvt-mv-gender ${gender === 'female' ? 'hvt-f' : (gender === 'male' ? 'hvt-m' : '')}">${genderIcon}</span>
                 ${lang ? `<span class="hvt-mv-locale">${esc(lang)}</span>` : ''}
                 ${eng ? `<span class="hvt-mv-engine ${eng.cls}" title="引擎: ${esc(eng.full)}">${esc(eng.short)}</span>` : ''}
-                <span class="hvt-mv-id" title="${esc(id)}">${esc(id.slice(0,8))}…</span>
-                <button class="hvt-mv-copy-btn hvt-btn" data-id="${esc(id)}" title="复制 Voice ID">复制ID</button>
-                <button class="hvt-mv-share-btn hvt-btn" title="共享给团队成员（批量邮箱）">🔗 共享</button>
+                <span class="hvt-mv-id" title="${esc(id)}（单击复制）">${esc(id.slice(0,16))}…</span>
+                <button class="hvt-mv-share-btn hvt-btn" title="共享给团队成员（批量邮箱）">🔗</button>
                 <button class="hvt-mv-dl-btn hvt-btn" title="下载 MP3">⬇</button>
             `;
             const chk = row.querySelector('.hvt-mv-chk');
@@ -2522,24 +2799,8 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 else mvSelectedIds.delete(id);
                 mvUpdateSelectionUI();
             });
-            row.querySelector('.hvt-mv-play-btn').addEventListener('click', () => mvTogglePlay(v));
-            row.querySelector('.hvt-mv-name-copy-btn').addEventListener('click', e => {
-                navigator.clipboard.writeText(name).then(() => {
-                    const btn = e.currentTarget;
-                    const orig = btn.textContent;
-                    btn.textContent = '✓';
-                    btn.classList.add('hvt-copied');
-                    setTimeout(() => { btn.textContent = orig; btn.classList.remove('hvt-copied'); }, 1200);
-                });
-            });
-            row.querySelector('.hvt-mv-copy-btn').addEventListener('click', e => {
-                navigator.clipboard.writeText(id).then(() => {
-                    const btn = e.currentTarget;
-                    const orig = btn.textContent;
-                    btn.textContent = '已复制';
-                    setTimeout(() => { btn.textContent = orig; }, 1200);
-                });
-            });
+            row.querySelector('.hvt-mv-play-btn').addEventListener('click', (e) => mvTogglePlay(v, e.shiftKey));
+            mvBindCopyRename(row, v, true, mvPersistCache);
             row.querySelector('.hvt-mv-share-btn').addEventListener('click', () => mvOpenShare(v));
             row.querySelector('.hvt-mv-dl-btn').addEventListener('click', () => mvDownloadOne(v));
             frag.appendChild(row);
@@ -2591,19 +2852,17 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             row.className = 'hvt-mv-row';
             row.innerHTML = `
                 <input type="checkbox" class="hvt-mv-chk" title="选择删除/下载" ${checked ? 'checked' : ''}>
-                <button class="hvt-mv-play-btn" data-mv-id="${esc(id)}" title="试听（需几秒加载）">
+                <button class="hvt-mv-play-btn" data-mv-id="${esc(id)}" title="试听（首次加载后长期缓存；Shift+点击强制重新加载）">
                     <svg class="ic-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/></svg>
                     <svg class="ic-stop" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>
                     <svg class="ic-spin" viewBox="0 0 24 24" style="display:none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2.5" fill="none" stroke-dasharray="28" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/></circle></svg>
                 </button>
                 <span class="hvt-sp-origin ${isShared ? 'hvt-sp-shared' : 'hvt-sp-self'}" title="${isShared ? '由社区外账号分享进来' : '在本社区内创建'}">${isShared ? '分享进来' : '自生成'}</span>
-                <span class="hvt-mv-name" title="${esc(name)}">${esc(name)}</span>
-                <button class="hvt-mv-name-copy-btn" title="复制名称">📋</button>
-                ${genderIcon ? `<span class="hvt-mv-gender ${gender === 'female' ? 'hvt-f' : 'hvt-m'}">${genderIcon}</span>` : ''}
+                <span class="hvt-mv-name" title="${esc(name)}（单击复制 · 双击改名）">${esc(name)}</span>
+                <span class="hvt-mv-gender ${gender === 'female' ? 'hvt-f' : (gender === 'male' ? 'hvt-m' : '')}">${genderIcon}</span>
                 ${lang ? `<span class="hvt-mv-locale">${esc(lang)}</span>` : ''}
                 ${eng ? `<span class="hvt-mv-engine ${eng.cls}" title="引擎: ${esc(eng.full)}">${esc(eng.short)}</span>` : ''}
-                <span class="hvt-mv-id" title="${esc(id)}">${esc(id.slice(0,8))}…</span>
-                <button class="hvt-mv-copy-btn hvt-btn" data-id="${esc(id)}" title="复制 Voice ID">复制ID</button>
+                <span class="hvt-mv-id" title="${esc(id)}（单击复制）">${esc(id.slice(0,16))}…</span>
                 <button class="hvt-mv-dl-btn hvt-btn" title="下载 MP3">⬇</button>
             `;
             const chk = row.querySelector('.hvt-mv-chk');
@@ -2612,23 +2871,8 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 else spaceSelectedIds.delete(id);
                 mvUpdateSelectionUI();
             });
-            row.querySelector('.hvt-mv-play-btn').addEventListener('click', () => mvTogglePlay(v));
-            row.querySelector('.hvt-mv-name-copy-btn').addEventListener('click', e => {
-                navigator.clipboard.writeText(name).then(() => {
-                    const btn = e.currentTarget;
-                    const orig = btn.textContent;
-                    btn.textContent = '✓';
-                    btn.classList.add('hvt-copied');
-                    setTimeout(() => { btn.textContent = orig; btn.classList.remove('hvt-copied'); }, 1200);
-                });
-            });
-            row.querySelector('.hvt-mv-copy-btn').addEventListener('click', e => {
-                navigator.clipboard.writeText(id).then(() => {
-                    const btn = e.currentTarget; const orig = btn.textContent;
-                    btn.textContent = '已复制';
-                    setTimeout(() => { btn.textContent = orig; }, 1200);
-                });
-            });
+            row.querySelector('.hvt-mv-play-btn').addEventListener('click', (e) => mvTogglePlay(v, e.shiftKey));
+            mvBindCopyRename(row, v, !!(myUsername && v.creator_username === myUsername), spacePersistCache);
             row.querySelector('.hvt-mv-dl-btn').addEventListener('click', () => mvDownloadOne(v));
             frag.appendChild(row);
         });
@@ -4169,6 +4413,105 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         });
     }
 
+    // ── 精简 ZIP 解包（存储/deflate 两种压缩方式；Chrome 原生 DecompressionStream） ──
+    // 返回 File[]（带原文件名与推断的 MIME type），跳过目录项与 macOS 元数据
+    async function bpUnzip(zipFile) {
+        const buf = new Uint8Array(await zipFile.arrayBuffer());
+        const dv = new DataView(buf.buffer);
+        // 从尾部找 EOCD 签名 0x06054b50
+        let eocd = -1;
+        for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65558); i--) {
+            if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+        }
+        if (eocd < 0) throw new Error('无效的 ZIP 文件');
+        const count = dv.getUint16(eocd + 10, true);
+        let p = dv.getUint32(eocd + 16, true);      // 中央目录偏移
+        const utf8 = new TextDecoder('utf-8');
+        const mime = (name) => ({ jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif' })[(name.split('.').pop() || '').toLowerCase()] || '';
+        const out = [];
+        for (let n = 0; n < count; n++) {
+            if (dv.getUint32(p, true) !== 0x02014b50) break;
+            const method  = dv.getUint16(p + 10, true);
+            const csize   = dv.getUint32(p + 20, true);
+            const nameLen = dv.getUint16(p + 28, true);
+            const extraLen = dv.getUint16(p + 30, true);
+            const cmtLen  = dv.getUint16(p + 32, true);
+            const lho     = dv.getUint32(p + 42, true);   // 本地头偏移
+            const path    = utf8.decode(buf.subarray(p + 46, p + 46 + nameLen));
+            p += 46 + nameLen + extraLen + cmtLen;
+            const base = path.split('/').pop();
+            if (!base || path.endsWith('/') || path.includes('__MACOSX') || base.startsWith('.')) continue;
+            // 数据紧跟本地头（其 name/extra 长度须从本地头自身读取）
+            const dataOff = lho + 30 + dv.getUint16(lho + 26, true) + dv.getUint16(lho + 28, true);
+            const raw = buf.subarray(dataOff, dataOff + csize);
+            let bytes;
+            if (method === 0) bytes = raw;
+            else if (method === 8) {
+                const ds = new DecompressionStream('deflate-raw');
+                bytes = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(ds)).arrayBuffer());
+            } else throw new Error(`不支持的压缩方式(${method})：${base}`);
+            out.push(new File([bytes], base, { type: mime(base) }));
+        }
+        return out;
+    }
+
+    // ── ARH（AvatarReelsHelper）copy.tsv 格式 ──
+    // 头部若干元数据行「key<TAB>value」（voice_id / voice_engine / voice_speed…），
+    // 正文行「#N#<TAB>中文<TAB>英文」。图片文件名以「N_」开头与 #N# 精确配对。
+    // 返回 null 表示不是 ARH 格式；否则 { meta, items: [{id, chinese, english}] }
+    function bpParseArhTsv(raw) {
+        const txt = String(raw || '').replace(/\r/g, '').trim();
+        if (!/^#\d+#\t/m.test(txt)) return null;
+        const meta = {};
+        const items = [];
+        for (const line of txt.split('\n')) {
+            const m = line.match(/^#(\d+)#\t(.*)$/);
+            if (m) {
+                const cols = m[2].split('\t');
+                items.push({ id: parseInt(m[1], 10), chinese: (cols[0] || '').trim(), english: (cols[1] || '').trim() });
+            } else if (line.includes('\t')) {
+                const [k, ...rest] = line.split('\t');
+                const key = k.trim();
+                if (key && !/^#id#$/i.test(key)) meta[key] = rest.join('\t').trim();
+            }
+        }
+        return items.length ? { meta, items } : null;
+    }
+    // ARH 导入：按图片文件名前导编号与 #N# 配对，与选图顺序无关
+    async function bpImportArhTasks(files, arh) {
+        const byId = new Map(arh.items.map(it => [it.id, it]));
+        const pairs = [];
+        for (const f of files) {
+            const m = f.name.match(/^(\d+)[_\-.]/);
+            if (!m) { showToast(`图片「${f.name}」文件名无前导编号，无法与 #N# 配对`, 'error', 5000); return; }
+            const it = byId.get(parseInt(m[1], 10));
+            if (!it) { showToast(`图片「${f.name}」找不到对应的 #${m[1]}# 文案`, 'error', 5000); return; }
+            if (!it.english) { showToast(`#${it.id}# 缺英文文案`, 'error', 5000); return; }
+            pairs.push({ file: f, it });
+        }
+        if (pairs.length !== arh.items.length) {
+            showToast(`图片 ${pairs.length} 张 ≠ 文案 ${arh.items.length} 条，请一一对应`, 'error', 4500);
+            return;
+        }
+        pairs.sort((a, b) => a.it.id - b.it.id);
+        const voiceId = arh.meta.voice_id || '';
+        for (let i = 0; i < pairs.length; i++) {
+            const { file, it } = pairs[i];
+            const id = `bp_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 7)}`;
+            const blob = await bpPrepareImage(file);
+            await bpIdbPut(id, blob);
+            bpDb.tasks.push({
+                id, title: file.name.replace(/\.[^.]+$/, ''), script: it.english,
+                voiceId, status: '待提交',
+                groupId: '', draftId: '', videoUrl: '', error: '', submittedAt: 0,
+            });
+        }
+        bpSaveDb();
+        bpRenderTasks();
+        bpKick();
+        showToast(`已添加 ${pairs.length} 个任务（ARH 按编号配对${voiceId ? '，声音 ' + voiceId.slice(0, 8) + '…' : ''}）`, 'success');
+    }
+
     // ── 任务导入：多图 + 文案，按顺序配对 ──
     // 文案支持三种粘贴格式：
     //   1. 谷歌表格整行（含制表符）：每行一条，「标题<TAB>文案」或仅「文案」列
@@ -4192,8 +4535,10 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         return blocks.map(b => ({ script: b }));
     }
     async function bpImportTasks(files, scriptsRaw) {
-        const scripts = bpSplitScripts(scriptsRaw);
         if (!files.length) { showToast('请选择图片', 'error'); return; }
+        const arh = bpParseArhTsv(scriptsRaw);
+        if (arh) { await bpImportArhTasks(files, arh); return; }
+        const scripts = bpSplitScripts(scriptsRaw);
         if (scripts.length !== files.length) {
             showToast(`图片 ${files.length} 张 ≠ 文案 ${scripts.length} 条，请一一对应`, 'error', 4500);
             return;
@@ -4356,12 +4701,15 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                   </div>
                 </div>
                 <div class="hvt-bp-section">
-                  <div class="hvt-bp-sec-title">② 添加任务（图片按文件名排序，与文案按顺序一一配对）</div>
+                  <div class="hvt-bp-sec-title">② 添加任务</div>
                   <div class="hvt-bp-line">
-                    <input type="file" id="hvt-bp-imgs" accept="image/*" multiple>
+                    <label id="hvt-bp-arh-drop" title="ARH 导出包含 copy.tsv 与图片；载入后按编号自动精确配对，并自动填入声音 ID">📦 ARH 导入：点击选 .zip，或把导出文件夹拖到这里<input type="file" id="hvt-bp-zip" accept=".zip" style="display:none"></label>
+                  </div>
+                  <div class="hvt-bp-line">
+                    <label title="手动模式：图片按文件名排序，与下方文案按顺序一一配对">或手动选图 <input type="file" id="hvt-bp-imgs" accept="image/*" multiple></label>
                   </div>
                   <div id="hvt-bp-img-strip" style="display:none"></div>
-                  <textarea id="hvt-bp-scripts" placeholder="粘贴文案，条数须与图片数一致。支持：&#10;· 谷歌表格整行粘贴（每行一条；两列时第 1 列作标题、第 2 列作文案）&#10;· 空行分段 / 每行一条"></textarea>
+                  <textarea id="hvt-bp-scripts" placeholder="粘贴文案（或用「📦 ARH 导入」自动填入）。支持：&#10;· ARH copy.tsv（#N# 与图片文件名前导编号精确配对，自动带 voice_id）&#10;· 谷歌表格整行粘贴（每行一条；两列时第 1 列作标题、第 2 列作文案）&#10;· 空行分段 / 每行一条"></textarea>
                   <div class="hvt-bp-line">
                     <button id="hvt-bp-add" class="hvt-btn hvt-btn-primary">添加任务</button>
                   </div>
@@ -4406,6 +4754,64 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 `<span class="hvt-bp-strip-item"><span class="hvt-bp-strip-idx">${i + 1}</span><img alt=""><span class="hvt-bp-strip-name">${esc(f.name)}</span></span>`
             ).join('');
             strip.querySelectorAll('img').forEach((im, i) => { im.src = URL.createObjectURL(files[i]); });
+        });
+
+        // ARH 整包载入（文件夹/zip 共用）：图片填入图片选择框（触发预览条）、copy.tsv 读入文案框
+        const bpLoadArhBundle = async (all, srcLabel) => {
+            const imgs = all.filter(f => f.type.startsWith('image/') && !f.name.startsWith('.'));
+            const tsv = all.find(f => f.name.toLowerCase() === 'copy.tsv')
+                     || all.find(f => /\.(tsv|txt|csv)$/i.test(f.name) && !f.name.startsWith('.'));
+            if (!imgs.length || !tsv) {
+                showToast(`${srcLabel}缺${!imgs.length ? '图片' : ''}${!imgs.length && !tsv ? '和' : ''}${!tsv ? '文案文件(copy.tsv)' : ''}`, 'error', 4500);
+                return;
+            }
+            const dt = new DataTransfer();
+            imgs.forEach(f => dt.items.add(f));
+            g('hvt-bp-imgs').files = dt.files;
+            g('hvt-bp-imgs').dispatchEvent(new Event('change'));
+            g('hvt-bp-scripts').value = await tsv.text();
+            showToast(`已载入 ${imgs.length} 张图片 + ${tsv.name}，请核对后点「添加任务」`, 'success');
+        };
+        g('hvt-bp-zip').addEventListener('change', async () => {
+            const zf = g('hvt-bp-zip').files[0];
+            g('hvt-bp-zip').value = '';
+            if (!zf) return;
+            try {
+                await bpLoadArhBundle(await bpUnzip(zf), '压缩包');
+            } catch (e) {
+                showToast(`解压失败：${e.message}`, 'error', 5000);
+            }
+        });
+        // 同一入口支持拖入导出文件夹或 zip（Finder 拖放）
+        const bpEntryFiles = async (entry) => {
+            if (entry.isFile) return [await new Promise((res, rej) => entry.file(res, rej))];
+            const reader = entry.createReader();
+            const children = [];
+            // readEntries 每次最多返回 100 条，须循环读空
+            for (;;) {
+                const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+                if (!batch.length) break;
+                children.push(...batch);
+            }
+            const out = [];
+            for (const c of children) out.push(...await bpEntryFiles(c));
+            return out;
+        };
+        const arhDrop = g('hvt-bp-arh-drop');
+        arhDrop.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); arhDrop.classList.add('hvt-bp-drop-over'); });
+        arhDrop.addEventListener('dragleave', () => arhDrop.classList.remove('hvt-bp-drop-over'));
+        arhDrop.addEventListener('drop', async (e) => {
+            e.preventDefault(); e.stopPropagation();
+            arhDrop.classList.remove('hvt-bp-drop-over');
+            try {
+                const entries = [...e.dataTransfer.items].map(it => it.webkitGetAsEntry()).filter(Boolean);
+                let all = [];
+                for (const en of entries) all.push(...await bpEntryFiles(en));
+                if (all.length === 1 && /\.zip$/i.test(all[0].name)) all = await bpUnzip(all[0]);
+                if (all.length) await bpLoadArhBundle(all, '拖入内容');
+            } catch (err) {
+                showToast(`载入失败：${err.message}`, 'error', 5000);
+            }
         });
 
         g('hvt-bp-add').addEventListener('click', async () => {
@@ -4524,6 +4930,57 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             </button>
         `;
         document.body.appendChild(fabStrip);
+
+        // 浮动图标条可拖动 + 位置记忆（拖动超过 6px 才算拖，否则仍是点击）
+        (function initFabDrag() {
+            const FAB_POS_KEY = 'hvt_fab_pos';
+            function applyPos(x, y) {
+                const w = fabStrip.offsetWidth || 300, h = fabStrip.offsetHeight || 48;
+                x = Math.min(Math.max(0, x), window.innerWidth - w);
+                y = Math.min(Math.max(0, y), window.innerHeight - h);
+                fabStrip.style.left = x + 'px';
+                fabStrip.style.top = y + 'px';
+                fabStrip.style.right = 'auto';
+                fabStrip.style.bottom = 'auto';
+            }
+            try {
+                const p = JSON.parse(localStorage.getItem(FAB_POS_KEY));
+                if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) applyPos(p.x, p.y);
+            } catch {}
+            let drag = null;
+            let suppressClick = false;
+            fabStrip.addEventListener('pointerdown', (e) => {
+                const r = fabStrip.getBoundingClientRect();
+                drag = { startX: e.clientX, startY: e.clientY, origX: r.left, origY: r.top, moved: false };
+                // 注意：此处不能立即 setPointerCapture——捕获会把 click 重定向到条本身，按钮就点不到了
+            });
+            fabStrip.addEventListener('pointermove', (e) => {
+                if (!drag) return;
+                const dx = e.clientX - drag.startX, dy = e.clientY - drag.startY;
+                if (!drag.moved && Math.hypot(dx, dy) < 6) return;
+                if (!drag.moved) { try { fabStrip.setPointerCapture(e.pointerId); } catch {} }
+                drag.moved = true;
+                fabStrip.dataset.dragging = '1';
+                applyPos(drag.origX + dx, drag.origY + dy);
+            });
+            fabStrip.addEventListener('pointerup', () => {
+                if (drag && drag.moved) {
+                    const r = fabStrip.getBoundingClientRect();
+                    try { localStorage.setItem(FAB_POS_KEY, JSON.stringify({ x: r.left, y: r.top })); } catch {}
+                    suppressClick = true;
+                    setTimeout(() => { suppressClick = false; }, 0);
+                }
+                delete fabStrip.dataset.dragging;
+                drag = null;
+            });
+            fabStrip.addEventListener('click', (e) => {
+                if (suppressClick) { e.stopPropagation(); e.preventDefault(); }
+            }, true);
+            window.addEventListener('resize', () => {
+                const r = fabStrip.getBoundingClientRect();
+                if (fabStrip.style.left) applyPos(r.left, r.top);
+            });
+        })();
 
         const root = document.createElement('div');
         root.id = 'hvt-root';
@@ -4655,25 +5112,38 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                     <label class="hvt-vd-label">上传头像生成提示词（可选）</label>
                     <div id="hvt-vd-engine-tabs">
                       <button class="hvt-vd-engine-tab" data-engine="heygen">HeyGen 官方</button>
-                      <button class="hvt-vd-engine-tab" data-engine="gemini">Gemini AI</button>
+                      <button class="hvt-vd-engine-tab" data-engine="gemini">AI 分析</button>
                     </div>
-                    <button id="hvt-gm-settings-toggle" class="hvt-btn" title="Gemini 设置" style="display:none">⚙ 设置</button>
+                    <button id="hvt-gm-settings-toggle" class="hvt-btn" title="AI 分析设置（Gemini / OpenRouter）" style="display:none">⚙ 设置</button>
                   </div>
                   <div id="hvt-gm-settings" style="display:none">
                     <div class="hvt-gm-set-row">
+                      <label>服务商</label>
+                      <select id="hvt-gm-provider" class="hvt-input">
+                        <option value="gemini">Gemini 官方</option>
+                        <option value="openrouter">OpenRouter（免费模型池）</option>
+                      </select>
+                    </div>
+                    <div class="hvt-gm-set-row" id="hvt-gm-key-row">
                       <label>API Key</label>
                       <input id="hvt-gm-key" class="hvt-input" type="password" placeholder="在 aistudio.google.com 免费获取">
                     </div>
+                    <div class="hvt-gm-set-row" id="hvt-or-key-row" style="display:none">
+                      <label>API Key</label>
+                      <input id="hvt-or-key" class="hvt-input" type="password" placeholder="在 openrouter.ai 免费获取（sk-or-…）">
+                    </div>
                     <div class="hvt-gm-set-row">
                       <label>模型</label>
-                      <input id="hvt-gm-model" class="hvt-input" placeholder="gemini-2.5-flash">
+                      <select id="hvt-gm-model" class="hvt-input"></select>
+                      <button id="hvt-gm-models-refresh" class="hvt-btn" title="实时拉取当前服务商可用模型列表（OpenRouter 只列免费+支持图片的模型）">🔄</button>
                     </div>
                     <div class="hvt-gm-set-row hvt-gm-set-col">
                       <label>系统指令（可精调，输出格式须保留 \`\`\`prompt 代码块）</label>
                       <textarea id="hvt-gm-sys" class="hvt-vd-textarea"></textarea>
                     </div>
                     <div class="hvt-gm-set-actions">
-                      <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">获取免费 API Key ↗</a>
+                      <a id="hvt-gm-key-link" href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">获取免费 API Key ↗</a>
+                      <a id="hvt-or-key-link" href="https://openrouter.ai/settings/keys" target="_blank" rel="noopener" style="display:none">获取 OpenRouter Key ↗</a>
                       <button id="hvt-gm-sys-reset" class="hvt-btn">恢复默认指令</button>
                       <button id="hvt-gm-save" class="hvt-btn hvt-btn-primary">保存设置</button>
                     </div>
@@ -4704,7 +5174,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                       <span id="hvt-gm-status"></span>
                     </div>
                     <div id="hvt-gm-result" style="display:none">
-                      <details id="hvt-gm-analysis"><summary>查看 Gemini 完整分析</summary><pre id="hvt-gm-analysis-text"></pre></details>
+                      <details id="hvt-gm-analysis"><summary>查看 AI 完整分析</summary><pre id="hvt-gm-analysis-text"></pre></details>
                       <div id="hvt-gm-prompts"></div>
                       <div class="hvt-vd-form-actions">
                         <button id="hvt-gm-create" class="hvt-btn hvt-btn-primary">⚡ 生成所选声音</button>
@@ -4714,10 +5184,18 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                   </div>
                 </div>
                 <div class="hvt-vd-form-row">
-                  <label class="hvt-vd-label">提示词</label>
+                  <label class="hvt-vd-label">提示词
+                    <a id="hvt-vd-gpt-link" href="https://chatgpt.com/g/g-69dbc173671081918d1fc9fb3fcaff1d-ren-wu-pei-yin-ti-shi-ci-sheng-cheng-qi" target="_blank" rel="noopener" title="打开 ChatGPT「人物配音提示词生成器」，上传图片生成提示词后粘贴回下方输入框">🤖 ChatGPT 提示词生成器 ↗</a>
+                  </label>
                   <textarea id="hvt-vd-prompt" class="hvt-vd-textarea" placeholder="描述声音特征：年龄、性别、风格、口音、情绪……&#10;例：A high-pitched, energetic voice of a 4-year-old American boy with a slight childish lisp."></textarea>
                 </div>
                 <div class="hvt-vd-form-actions">
+                  <select id="hvt-vd-count" class="hvt-input" title="一次生成的试听数量（HeyGen 每组固定出 3 个，多组会依次请求）">
+                    <option value="1">3 个（1组）</option>
+                    <option value="2">6 个（2组）</option>
+                    <option value="3">9 个（3组）</option>
+                    <option value="4">12 个（4组）</option>
+                  </select>
                   <button id="hvt-vd-generate" class="hvt-btn hvt-btn-primary">⚡ 生成</button>
                   <span id="hvt-vd-status"></span>
                 </div>
@@ -4745,6 +5223,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                   <button id="hvt-mv-space-toggle" class="hvt-btn" title="切换显示：本号自带声音 / 社区（Space）声音">🌐 社区声音</button>
                   <button id="hvt-mv-exp" class="hvt-btn" title="分享到期清理：撤销超过设定天数的对外分享">⏰ 到期清理</button>
                   <button id="hvt-mv-refresh" class="hvt-btn" title="刷新列表">↺ 刷新</button>
+                  <button id="hvt-mv-audio-clear" class="hvt-btn" title="清空所有已缓存的试听音频（单个声音可 Shift+点击试听按钮单独刷新）">🧹 试听缓存</button>
                   <button id="hvt-mv-dl-sel" class="hvt-btn hvt-btn-primary" title="下载已勾选的声音" style="display:none">⬇ 下载已选</button>
                   <button id="hvt-mv-del-sel" class="hvt-btn hvt-btn-danger" title="删除已勾选、且是你自己创建的声音（不可逆）" style="display:none">🗑 删除选中</button>
                   <button id="hvt-mv-dl-all" class="hvt-btn" title="下载全部声音 MP3">⬇ 全部下载</button>
@@ -5284,8 +5763,11 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         document.getElementById('hvt-gm-settings-toggle').addEventListener('click', () => {
             const el = document.getElementById('hvt-gm-settings');
             el.style.display = el.style.display === 'none' ? '' : 'none';
+            if (el.style.display !== 'none') gmRefreshModels(false); // 缓存过期则静默同步
         });
         gmLoadSettingsUI();
+        document.getElementById('hvt-gm-models-refresh').addEventListener('click', () => gmRefreshModels(true));
+        document.getElementById('hvt-gm-provider').addEventListener('change', () => { gmProviderUI(); gmRefreshModels(false); });
         document.getElementById('hvt-gm-save').addEventListener('click', gmSaveSettings);
         document.getElementById('hvt-gm-sys-reset').addEventListener('click', () => {
             document.getElementById('hvt-gm-sys').value = GM_DEFAULT_SYS_PROMPT;
@@ -5340,6 +5822,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             if (mvViewMode === 'space') spacePrefetch();
             else mvLoadVoices(true);
         });
+        document.getElementById('hvt-mv-audio-clear').addEventListener('click', mvAudioClearAll);
         document.getElementById('hvt-mv-space-toggle').addEventListener('click', () => {
             mvSetViewMode(mvViewMode === 'space' ? 'self' : 'space');
         });

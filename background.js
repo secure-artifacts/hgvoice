@@ -126,9 +126,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 // content.js 请求 Gemini 分析头像图片 → 声音设计提示词。
 // 在 service worker 里 fetch，绕开页面 CSP 限制（generativelanguage 已在 host_permissions）。
+
+// 进行中的 AI 分析请求，供 hvt_ai_abort 中止（SW 若被回收，fetch 也随之终止，无需持久化）
+const hvtAiAborts = new Map();
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg.type === 'hvt_ai_abort') {
+        const ctl = hvtAiAborts.get(msg.reqId);
+        if (ctl) ctl.abort();
+        hvtAiAborts.delete(msg.reqId);
+        sendResponse({ ok: true });
+        return;
+    }
+
     if (msg.type === 'hvt_gemini_generate') {
         (async () => {
+            const ctl = new AbortController();
+            if (msg.reqId) hvtAiAborts.set(msg.reqId, ctl);
             try {
                 const { apiKey, model, systemPrompt, images, userNote } = msg;
                 const parts = images.map((img) => ({
@@ -138,6 +152,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
                 const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
                 const res = await fetch(url, {
                     method: 'POST',
+                    signal: ctl.signal,
                     headers: {
                         'Content-Type': 'application/json',
                         'x-goog-api-key': apiKey
@@ -162,6 +177,145 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
                     throw new Error(reason ? `Gemini 未返回内容 (${reason})` : 'Gemini 未返回内容');
                 }
                 sendResponse({ ok: true, text });
+            } catch (e) {
+                sendResponse({ ok: false, error: ctl.signal.aborted ? '已中止' : e.message });
+            } finally {
+                if (msg.reqId) hvtAiAborts.delete(msg.reqId);
+            }
+        })();
+        return true;
+    }
+
+    if (msg.type === 'hvt_gemini_list_models') {
+        (async () => {
+            try {
+                const models = [];
+                let pageToken = '';
+                do {
+                    const url = `https://generativelanguage.googleapis.com/v1beta/models?pageSize=200${pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''}`;
+                    const res = await fetch(url, { headers: { 'x-goog-api-key': msg.apiKey } });
+                    const data = await res.json().catch(() => null);
+                    if (!res.ok) {
+                        const apiMsg = data && data.error && data.error.message;
+                        throw new Error(apiMsg || `HTTP ${res.status}`);
+                    }
+                    for (const m of (data.models || [])) {
+                        models.push({
+                            id: String(m.name || '').replace(/^models\//, ''),
+                            methods: m.supportedGenerationMethods || []
+                        });
+                    }
+                    pageToken = data.nextPageToken || '';
+                } while (pageToken);
+                sendResponse({ ok: true, models });
+            } catch (e) {
+                sendResponse({ ok: false, error: e.message });
+            }
+        })();
+        return true;
+    }
+
+    // OpenRouter：OpenAI 兼容 chat/completions，图片走 data URI
+    if (msg.type === 'hvt_or_generate') {
+        (async () => {
+            const ctl = new AbortController();
+            if (msg.reqId) hvtAiAborts.set(msg.reqId, ctl);
+            try {
+                const { apiKey, model, systemPrompt, images, userNote } = msg;
+                const content = images.map((img) => ({
+                    type: 'image_url',
+                    image_url: { url: 'data:image/jpeg;base64,' + img }
+                }));
+                content.push({ type: 'text', text: userNote || '请分析图中人物并按格式输出声音设计提示词。' });
+                // 免费模型托管方偶发宕机（502 Provider returned error）；OpenRouter 每次请求
+                // 重新路由节点，自动重试大概率落到健康节点
+                const MAX_RETRIES = 2;
+                let res, data;
+                for (let attempt = 0; ; attempt++) {
+                    res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+                        method: 'POST',
+                        signal: ctl.signal,
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': 'Bearer ' + apiKey
+                        },
+                        body: JSON.stringify({
+                            model,
+                            messages: [
+                                { role: 'system', content: systemPrompt },
+                                { role: 'user', content }
+                            ],
+                            temperature: 0.7
+                        })
+                    });
+                    data = await res.json().catch(() => null);
+                    if (res.ok) break;
+                    const retriable = res.status === 429 || res.status >= 500;
+                    if (!retriable || attempt >= MAX_RETRIES) {
+                        const apiMsg = data && data.error && data.error.message;
+                        const retried = retriable ? `（已自动重试 ${MAX_RETRIES} 次）` : '';
+                        throw new Error((apiMsg || `HTTP ${res.status}`) + retried);
+                    }
+                    await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+                    if (ctl.signal.aborted) throw new Error('已中止');
+                }
+                const choice = data && data.choices && data.choices[0];
+                const text = choice && choice.message && choice.message.content;
+                if (!text) throw new Error('OpenRouter 未返回内容');
+                sendResponse({ ok: true, text });
+            } catch (e) {
+                sendResponse({ ok: false, error: ctl.signal.aborted ? '已中止' : e.message });
+            } finally {
+                if (msg.reqId) hvtAiAborts.delete(msg.reqId);
+            }
+        })();
+        return true;
+    }
+
+    // OpenRouter 模型列表：公开接口，无需 API Key
+    if (msg.type === 'hvt_or_list_models') {
+        (async () => {
+            try {
+                const res = await fetch('https://openrouter.ai/api/v1/models');
+                const data = await res.json().catch(() => null);
+                if (!res.ok) throw new Error((data && data.error && data.error.message) || `HTTP ${res.status}`);
+                const models = (data.data || []).map((m) => {
+                    const out = (m.architecture && m.architecture.output_modalities) || [];
+                    return {
+                        id: m.id,
+                        free: !!m.pricing && m.pricing.prompt === '0' && m.pricing.completion === '0',
+                        image: !!m.architecture && (m.architecture.input_modalities || []).includes('image'),
+                        // 纯文本输出（排除 lyria 等音乐/多模态生成模型）
+                        text: out.includes('text') && !out.includes('audio') && !out.includes('image')
+                    };
+                });
+                sendResponse({ ok: true, models });
+            } catch (e) {
+                sendResponse({ ok: false, error: e.message });
+            }
+        })();
+        return true;
+    }
+
+    // OpenRouter 模型节点健康度：每个模型取其所有托管节点的最高在线率（30 分钟优先，缺数据退 1 天）
+    if (msg.type === 'hvt_or_models_health') {
+        (async () => {
+            try {
+                const uptime = {};
+                await Promise.all(msg.ids.map(async (id) => {
+                    try {
+                        const res = await fetch(`https://openrouter.ai/api/v1/models/${id}/endpoints`);
+                        const data = await res.json();
+                        const eps = (data.data && data.data.endpoints) || [];
+                        uptime[id] = eps.reduce((best, e) => {
+                            const u = e.uptime_last_30m != null ? e.uptime_last_30m : e.uptime_last_1d;
+                            return u != null && u > best ? u : best;
+                        }, 0);
+                    } catch {
+                        uptime[id] = null; // 单个查询失败视为未知，不误杀
+                    }
+                }));
+                sendResponse({ ok: true, uptime });
             } catch (e) {
                 sendResponse({ ok: false, error: e.message });
             }

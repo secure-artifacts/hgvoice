@@ -1,6 +1,6 @@
 # CLAUDE.md — 人声筛选工具（HeyGen Chrome 扩展）
 
-Manifest V3 内容脚本扩展，仅在 `app.heygen.com` 生效。**无构建步骤**——直接改源码，`chrome://extensions` 重载即生效。所有 API 调用复用页面 Session Cookie（`credentials: include`）。本地数据存 `localStorage`（主库 key `hvt_db`）。
+Manifest V3 内容脚本扩展，仅在 `app.heygen.com` 生效。**无构建步骤**——直接改源码，`chrome://extensions` 重载即生效。所有 API 调用复用页面 Session Cookie（`credentials: include`）。本地数据存 `localStorage`（主库 key `hvt_data_v1`）。
 
 ## 文件地图
 
