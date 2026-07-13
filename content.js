@@ -4233,6 +4233,20 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     let bpRunning      = false;
     let bpCurrentTask  = null;   // 正在执行链路的任务 id（防重入）
     let bpPreflighting = false;  // 预审阶段进行中（防重入）
+    let bpHasLock      = false;  // 跨标签页单实例锁：仅持锁标签才提交/轮询
+
+    // 单标签页选主：多个 HeyGen 标签页只允许一个真正提交渲染 + 轮询，
+    // 否则各标签页 worker 挑到同一条 待渲染 任务会重复出片。
+    // 锁随标签页上下文销毁自动释放，排队中的其它标签页自动接管（onAcquire 再次触发）。
+    function bpTryLock(onAcquire) {
+        if (!navigator.locks) { bpHasLock = true; onAcquire(); return; } // 极老环境兜底
+        navigator.locks.request('hvt_bp_leader_v1', { mode: 'exclusive' },
+            () => new Promise(() => {   // 永不 resolve → 持锁至本标签关闭
+                bpHasLock = true;
+                onAcquire();
+            })
+        );
+    }
 
     function bpLoadDb() {
         try { bpDb = JSON.parse(localStorage.getItem(BP_DB_KEY)) || null; } catch { bpDb = null; }
@@ -4241,10 +4255,16 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             voiceId: '', forceIII: true,
             spaceId: '',                        // 提交到哪个 Space（'' = 个人）
             groupName: '',                      // 整批共享头像组的名称（空 = 自动「批量-日期」）
-            orientation: 'portrait', resolution: '720p',
+            titlePrefix: '',                    // 视频名代号（前缀）：提交时拼到 task.title 最前
+            orientation: 'portrait', resolution: '1080p',
             intervalMin: 3, intervalMax: 8,     // 分钟
             hourlyCap: 10, scheduleAt: '', autoDownload: true,
         }, bpDb.settings || {});
+        // 一次性把旧默认 720p 抬到新默认 1080p（只跑一次；之后手动选 720p 不会再被改）
+        if (!bpDb.settings._res1080) {
+            if (bpDb.settings.resolution === '720p') bpDb.settings.resolution = '1080p';
+            bpDb.settings._res1080 = true;
+        }
         bpDb.tasks = bpDb.tasks || [];           // {id,title,script,voiceId,status,lookId,draftId,videoUrl,error,submittedAt}
         bpDb.groupId = bpDb.groupId || '';       // 整批共享的头像组 id（预审阶段建立）
         bpDb.log = Array.isArray(bpDb.log) ? bpDb.log : [];  // 运行日志（{t,level,title,msg}，尾部封顶）
@@ -4378,6 +4398,11 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         }));
     }
 
+    // 视频最终名 = 代号(前缀) + 任务标题；提交与下载统一取此
+    function bpFinalTitle(task) {
+        return (bpDb.settings.titlePrefix || '') + (task.title || '');
+    }
+
     // ── 提交渲染：Avatar Shots 通道，按 look_id 定位出片 ──
     async function bpShortcutSubmit(task) {
         const voiceId = task.voiceId || bpDb.settings.voiceId;
@@ -4387,7 +4412,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         const d = await heygenApi('/v2/avatar/shortcut/submit', {
             method: 'POST', headers: bpSpaceHeaders(),
             body: JSON.stringify({
-                video_title: task.title,
+                video_title: bpFinalTitle(task),
                 video_orientation: bpDb.settings.orientation,
                 resolution: bpDb.settings.resolution,
                 avatar_id: task.lookId,   // ← 传 look_id，渲染指定那个 look
@@ -4578,6 +4603,11 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
 
     function bpStart() {
         if (bpRunning) return;
+        if (!bpHasLock) {
+            bpSetStatusLine('另一个 HeyGen 标签页正在运行批量，请在该标签页操作，或关闭它后重试');
+            showToast('已有 HeyGen 标签页在运行批量，请勿多开', 'error', 3500);
+            return;
+        }
         if (!bpDb.settings.voiceId && bpDb.tasks.some(t => t.status === '待提交' && !t.voiceId)) {
             showToast('存在未指定声音 ID 的任务，且未设默认声音', 'error', 3500); return;
         }
@@ -4608,11 +4638,16 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             bpWorkerTimer = setTimeout(bpWorkerTick, 100);
         }
     }
+    // 批次是否已启动过（有在途任务）→ 停止后按钮显示「继续」而非「开始」
+    function bpStartedBefore() {
+        return bpDb.tasks.some(t => ['上传中', '审核中', '待渲染', '提交渲染中', '生成中'].includes(t.status));
+    }
     function bpUpdateRunButtons() {
-        const st = document.getElementById('hvt-bp-start');
-        const sp = document.getElementById('hvt-bp-stop');
-        if (st) st.style.display = bpRunning ? 'none' : '';
-        if (sp) sp.style.display = bpRunning ? '' : 'none';
+        const btn = document.getElementById('hvt-bp-toggle');
+        if (!btn) return;
+        btn.textContent = bpRunning ? '⏸ 停止提交' : (bpStartedBefore() ? '▶ 继续提交' : '▶ 开始提交');
+        btn.classList.toggle('hvt-btn-danger', bpRunning);
+        btn.classList.toggle('hvt-btn-primary', !bpRunning);
     }
 
     // ── 生成状态轮询 + 自动下载 ──
@@ -4652,7 +4687,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         }
     }
     function bpDownload(task) {
-        const safe = (task.title || task.draftId).replace(/[\\/:*?"<>|]/g, '_');
+        const safe = (bpFinalTitle(task) || task.draftId).replace(/[\\/:*?"<>|]/g, '_');
         chrome.runtime.sendMessage(
             { type: 'hvt_download', url: task.videoUrl, filename: `${safe}.mp4` },
             (res) => {
@@ -4765,6 +4800,11 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         }
         pairs.sort((a, b) => a.it.id - b.it.id);
         const voiceId = arh.meta.voice_id || '';
+        if (voiceId) {                          // ARH 带 voice_id → 自动填入默认声音框（meta 无则不覆盖用户已填值）
+            bpDb.settings.voiceId = voiceId;
+            const vEl = document.getElementById('hvt-bp-voice');
+            if (vEl) vEl.value = voiceId;
+        }
         for (let i = 0; i < pairs.length; i++) {
             const { file, it } = pairs[i];
             const id = `bp_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 7)}`;
@@ -4892,6 +4932,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         const g = (id) => document.getElementById(id);
         bpDb.settings.spaceId     = g('hvt-bp-space').value;
         bpDb.settings.groupName   = g('hvt-bp-gname').value.trim();
+        bpDb.settings.titlePrefix = g('hvt-bp-prefix').value;   // 不 trim：允许「A_」「A 」等带分隔符前缀
         bpDb.settings.voiceId     = g('hvt-bp-voice').value.trim();
         bpDb.settings.orientation = g('hvt-bp-orient').value;
         bpDb.settings.resolution  = g('hvt-bp-res').value;
@@ -4908,6 +4949,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         const g = (id) => document.getElementById(id);
         g('hvt-bp-space').value   = s.spaceId;
         g('hvt-bp-gname').value   = s.groupName;
+        g('hvt-bp-prefix').value  = s.titlePrefix || '';
         g('hvt-bp-voice').value   = s.voiceId;
         g('hvt-bp-orient').value  = s.orientation;
         g('hvt-bp-res').value     = s.resolution;
@@ -4956,6 +4998,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                       <select id="hvt-bp-space" class="hvt-input"><option value="">个人</option></select>
                     </label>
                     <label title="整批共用的头像组名称，留空自动用「批量-日期」">组名 <input id="hvt-bp-gname" class="hvt-input" placeholder="批量-日期"></label>
+                    <label title="加在每条视频名最前面的代号/前缀，留空不加；改动对未提交任务立即生效">代号 <input id="hvt-bp-prefix" class="hvt-input" placeholder="如 A_ / 项目名"></label>
                     <label>声音ID <input id="hvt-bp-voice" class="hvt-input" placeholder="默认 voice_id"></label>
                     <label>画幅
                       <select id="hvt-bp-orient" class="hvt-input">
@@ -4994,11 +5037,10 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                       ~ <input id="hvt-bp-int-max" class="hvt-input hvt-bp-num" type="number" min="0" step="0.5"></label>
                     <label>每小时上限 <input id="hvt-bp-cap" class="hvt-input hvt-bp-num" type="number" min="1" step="1"></label>
                     <label>定时启动 <input id="hvt-bp-schedule" class="hvt-input" type="datetime-local"></label>
-                    <button id="hvt-bp-start" class="hvt-btn hvt-btn-primary">▶ 开始</button>
-                    <button id="hvt-bp-stop" class="hvt-btn hvt-btn-danger" style="display:none">■ 暂停</button>
+                    <button id="hvt-bp-toggle" class="hvt-btn hvt-btn-primary">▶ 开始提交</button>
                   </div>
                   <div id="hvt-bp-status"></div>
-                  <div class="hvt-bp-note">⚠ 提交与轮询依赖本页面：请保持任意 HeyGen 标签页开启。关闭后重开会自动续跑。</div>
+                  <div class="hvt-bp-note">⚠ 提交与轮询依赖本页面：请保持任意 HeyGen 标签页开启，关闭后重开会自动续跑。多开时仅一个标签页负责提交，其余只查看（避免重复出片）。</div>
                 </div>
                 <div class="hvt-bp-section">
                   <div class="hvt-bp-sec-title">④ 任务队列</div>
@@ -5021,7 +5063,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         g('hvt-bp-close').addEventListener('click', () => { root.style.display = 'none'; });
         root.addEventListener('click', (e) => { if (e.target === root) root.style.display = 'none'; });
 
-        ['hvt-bp-space', 'hvt-bp-gname', 'hvt-bp-voice', 'hvt-bp-orient', 'hvt-bp-res', 'hvt-bp-force3', 'hvt-bp-autodl',
+        ['hvt-bp-space', 'hvt-bp-gname', 'hvt-bp-prefix', 'hvt-bp-voice', 'hvt-bp-orient', 'hvt-bp-res', 'hvt-bp-force3', 'hvt-bp-autodl',
          'hvt-bp-int-min', 'hvt-bp-int-max', 'hvt-bp-cap', 'hvt-bp-schedule']
             .forEach(id => g(id).addEventListener('change', bpSyncSettingsFromUI));
 
@@ -5108,8 +5150,10 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             strip.style.display = 'none'; strip.innerHTML = '';
         });
 
-        g('hvt-bp-start').addEventListener('click', () => { bpSyncSettingsFromUI(); bpStart(); });
-        g('hvt-bp-stop').addEventListener('click', bpStop);
+        g('hvt-bp-toggle').addEventListener('click', () => {
+            if (bpRunning) { bpStop(); }
+            else { bpSyncSettingsFromUI(); bpStart(); }
+        });
 
         g('hvt-bp-list').addEventListener('click', async (e) => {
             const row = e.target.closest('.hvt-bp-row');
@@ -5167,8 +5211,15 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             else if (t.status === '下载中')    t.status = t.videoUrl ? '已完成' : (t.draftId ? '生成中' : '待渲染');
         }
         bpSaveDb();
-        if (bpDb.tasks.some(t => t.status === '生成中')) bpEnsurePoller();
-        if (bpDb.running) { bpDb.running = false; bpStart(); }
+        // 后台工作（自动续跑提交 + 生成中轮询）只在取得单实例锁的标签页进行；
+        // 第二个 HeyGen 标签页取不到锁 → 只当查看器，不提交、不轮询，避免重复出片。
+        const willResume = bpDb.running || bpDb.tasks.some(t => t.status === '生成中');
+        if (willResume) bpSetStatusLine('等待取得提交权（避免多标签页重复提交）…');
+        bpTryLock(() => {
+            if (bpDb.tasks.some(t => t.status === '生成中')) bpEnsurePoller();
+            if (bpDb.running) { bpDb.running = false; bpStart(); }
+            else if (willResume) bpSetStatusLine('已取得提交权（本标签页负责轮询下载）');
+        });
     }
 
     // ─── Build UI ─────────────────────────────────────────────────────────────
