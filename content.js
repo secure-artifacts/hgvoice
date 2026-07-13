@@ -8,6 +8,7 @@
     const MV_CACHE_KEY = 'hvt_mv_cache_v1';
     const MV_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
     const SPACE_CACHE_KEY = 'hvt_space_voices_cache_v1'; // 社区（Space）声音缓存
+    const SPACE_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h：缓存新鲜则不自动全量重扫（点 ↺ 仍可强制刷新）
     // 分享到期清理（Share Expiry Cleanup）
     const EXP_LEDGER_KEY = 'hvt_share_ledger_v1'; // { "voiceId::email": 首次发现时间戳 }
     const EXP_DAYS_KEY = 'hvt_share_expiry_days';  // 用户配置的过期天数
@@ -219,6 +220,7 @@
     // ─── 社区（Space）声音 ───
     let spaceVoices = [];            // Space 作用域声音，每条带 _space/_spaceName/_origin
     let spaceMembers = new Set();    // 所有所属 Space 的成员 username 合集（用于判定 自生成/分享进来）
+    let spaceMemberEmails = new Map(); // username -> email（用于行复制时显示所属邮箱）
     let spacesList = [];             // [{id, name}]
     let spaceFetchRunning = false;   // 后台拉取进行中
     let spaceSelectedIds = new Set();// 社区声音视图下勾选的声音
@@ -226,6 +228,7 @@
     let spaceDelAbort = false;       // 停止社区删除循环
     let mvViewMode = 'self';         // 'self'=本号自带声音 | 'space'=社区声音
     let myUsername = null;           // 当前用户 username（创建者判定）
+    let myEmail = null;              // 当前用户邮箱（creator_username 是随机哈希，不是邮箱）
     let pvRows = [];                 // 「我的视频」扫描结果
     let pvScanning = false;
     let pvAbort = false;
@@ -1980,6 +1983,10 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     function openMyVoices() {
         const overlay = document.getElementById('hvt-mv-overlay');
         if (overlay) { overlay.style.display = 'flex'; mvSetViewMode('self'); }
+        if (!myUsername || !myEmail) expGetMyUsername().then(u => {
+            myUsername = u;
+            if (mvViewMode === 'self') mvRenderList();
+        });
     }
 
     function closeMyVoices() {
@@ -1995,7 +2002,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         const title = document.getElementById('hvt-mv-title');
         const expBtn = document.getElementById('hvt-mv-exp');
         if (mode === 'space') {
-            if (btn) { btn.textContent = '🎤 本号自带'; btn.classList.add('hvt-btn-primary'); }
+            if (btn) { btn.textContent = '🎤'; btn.title = '切换显示：本号自带声音'; btn.classList.add('hvt-btn-primary'); }
             if (title) title.textContent = '🌐 社区声音';
             if (expBtn) expBtn.style.display = 'none'; // 到期清理只针对本号自带
             if (!spaceVoices.length && !spaceFetchRunning) spacePrefetch();
@@ -2003,7 +2010,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             if (searchEl) searchEl.value = '';
             mvRenderList();
         } else {
-            if (btn) { btn.textContent = '🌐 社区声音'; btn.classList.remove('hvt-btn-primary'); }
+            if (btn) { btn.textContent = '🌐'; btn.title = '切换显示：社区（Space）声音'; btn.classList.remove('hvt-btn-primary'); }
             if (title) title.textContent = '🎤 我的声音';
             if (expBtn) expBtn.style.display = '';
             mvLoadVoices();
@@ -2203,7 +2210,11 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
 
     async function expGetMyUsername() {
         if (expMyUsername) return expMyUsername;
-        try { const d = await heygenApi('/v1/user.get'); expMyUsername = d?.username || null; } catch { expMyUsername = null; }
+        try {
+            const d = await heygenApi('/v1/user.get');
+            expMyUsername = d?.username || null;
+            myEmail = d?.email || null;
+        } catch { expMyUsername = null; }
         return expMyUsername;
     }
 
@@ -2653,7 +2664,15 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             delSelBtn.style.display = n > 0 ? 'inline-flex' : 'none';
             if (!mvDelRunning && !spaceDelRunning) delSelBtn.textContent = `🗑 删除选中 (${n})`;
         }
+        const clearSelBtn = document.getElementById('hvt-mv-clear-sel');
+        if (clearSelBtn) clearSelBtn.style.display = n > 0 ? 'inline-flex' : 'none';
         if (selCountEl) selCountEl.textContent = n > 0 ? `已选 ${n} 个` : '';
+    }
+
+    function mvClearSelection() {
+        mvActiveSel().clear();
+        document.querySelectorAll('#hvt-mv-list .hvt-mv-chk').forEach(chk => { chk.checked = false; });
+        mvUpdateSelectionUI();
     }
 
     // default_voice_engine → 展示用标签（短名 / 全名 / 配色 class）
@@ -2691,6 +2710,26 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             clearTimeout(clickTimer);
             if (!canRename) { showToast('只能改名自己创建的声音', 'error'); return; }
             mvStartRename(nameEl, v, persist);
+        });
+    }
+
+    // creator_username 是随机哈希，不是邮箱；真实邮箱要么是自己（myEmail），
+    // 要么从 Space 成员表（spaceMemberEmails，spacePrefetch 时填充）里查。
+    function mvResolveCreatorEmail(v) {
+        if (spaceMemberEmails.has(v.creator_username)) return spaceMemberEmails.get(v.creator_username);
+        if (myUsername && v.creator_username === myUsername) return myEmail || '';
+        return '';
+    }
+
+    // 行内非按钮区域单击：复制该声音完整信息（名称/ID/引擎/所属邮箱），每项一行
+    function mvBindRowCopy(row, v) {
+        row.addEventListener('click', (e) => {
+            if (e.target.closest('input, button, a, .hvt-mv-name, .hvt-mv-id')) return;
+            const name = v.display_name || v.voice_id || '';
+            const id = v.voice_id || '';
+            const eng = mvEngineInfo(v.default_voice_engine);
+            const text = [name, id, eng ? eng.full : '', mvResolveCreatorEmail(v)].join('\n');
+            navigator.clipboard.writeText(text).then(() => showToast('✅ 已复制完整信息', 'success', 1500));
         });
     }
 
@@ -2743,8 +2782,28 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         try { localStorage.setItem(MV_CACHE_KEY, JSON.stringify({ ts: Date.now(), voices: mvVoices })); } catch {}
     }
 
+    // 仅保留 UI 用到的字段，砍掉 preview 嵌套对象/shared_to 等重元数据，
+    // 避免 3000+ 条完整对象序列化超 localStorage ~5MB 配额导致写盘静默失败、缓存永不命中。
+    function spaceSlimVoice(v) {
+        return {
+            voice_id: v.voice_id,
+            display_name: v.display_name,
+            gender: v.gender,
+            language: v.language,
+            default_voice_engine: v.default_voice_engine,
+            creator_username: v.creator_username,
+            preview_audio: v.preview_audio || mvGetAudioUrl(v) || '', // 展平试听地址，丢弃 preview 对象
+            _space: v._space,
+            _spaceName: v._spaceName,
+            _origin: v._origin,
+        };
+    }
+
     function spacePersistCache() {
-        try { localStorage.setItem(SPACE_CACHE_KEY, JSON.stringify({ ts: Date.now(), voices: spaceVoices, members: [...spaceMembers] })); } catch {}
+        try {
+            const slim = spaceVoices.map(spaceSlimVoice);
+            localStorage.setItem(SPACE_CACHE_KEY, JSON.stringify({ ts: Date.now(), voices: slim, members: [...spaceMembers] }));
+        } catch {}
     }
 
     function mvRenderList() {
@@ -2775,6 +2834,8 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             const genderIcon = gender === 'female' ? '♀' : (gender === 'male' ? '♂' : '');
             const lang = v.language || '';
             const eng = mvEngineInfo(v.default_voice_engine);
+            const isMine = myUsername ? v.creator_username === myUsername : null;
+            const originDot = isMine === null ? '' : `<span class="hvt-mv-origin-dot ${isMine ? 'hvt-origin-self' : 'hvt-origin-shared'}" title="${isMine ? '本账号创建' : '其他账号分享给本账号'}"></span>`;
 
             const row = document.createElement('div');
             row.className = 'hvt-mv-row';
@@ -2785,10 +2846,11 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                     <svg class="ic-stop" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>
                     <svg class="ic-spin" viewBox="0 0 24 24" style="display:none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2.5" fill="none" stroke-dasharray="28" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/></circle></svg>
                 </button>
+                ${originDot}
                 <span class="hvt-mv-name" title="${esc(name)}（单击复制 · 双击改名）">${esc(name)}</span>
                 <span class="hvt-mv-gender ${gender === 'female' ? 'hvt-f' : (gender === 'male' ? 'hvt-m' : '')}">${genderIcon}</span>
-                ${lang ? `<span class="hvt-mv-locale">${esc(lang)}</span>` : ''}
-                ${eng ? `<span class="hvt-mv-engine ${eng.cls}" title="引擎: ${esc(eng.full)}">${esc(eng.short)}</span>` : ''}
+                <span class="hvt-mv-locale">${esc(lang) || '—'}</span>
+                <span class="hvt-mv-engine ${eng ? eng.cls : ''}" title="${eng ? `引擎: ${esc(eng.full)}` : ''}">${eng ? esc(eng.short) : '—'}</span>
                 <span class="hvt-mv-id" title="${esc(id)}（单击复制）">${esc(id.slice(0,16))}…</span>
                 <button class="hvt-mv-share-btn hvt-btn" title="共享给团队成员（批量邮箱）">🔗</button>
                 <button class="hvt-mv-dl-btn hvt-btn" title="下载 MP3">⬇</button>
@@ -2801,6 +2863,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             });
             row.querySelector('.hvt-mv-play-btn').addEventListener('click', (e) => mvTogglePlay(v, e.shiftKey));
             mvBindCopyRename(row, v, true, mvPersistCache);
+            mvBindRowCopy(row, v);
             row.querySelector('.hvt-mv-share-btn').addEventListener('click', () => mvOpenShare(v));
             row.querySelector('.hvt-mv-dl-btn').addEventListener('click', () => mvDownloadOne(v));
             frag.appendChild(row);
@@ -2814,9 +2877,18 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         if (!listEl) return;
 
         const q = (document.getElementById('hvt-mv-search')?.value || '').toLowerCase().trim();
-        const visible = q
+        const filtered = q
             ? spaceVoices.filter(v => (v.display_name || '').toLowerCase().includes(q) || (v.voice_id || '').toLowerCase().includes(q))
             : spaceVoices;
+        // 自生成置顶：稳定排序，自生成在前、分享进来在后，组内保持原有相对顺序
+        const visible = filtered
+            .map((v, i) => [v, i])
+            .sort((a, b) => {
+                const sa = a[0]._origin === 'shared' ? 1 : 0;
+                const sb = b[0]._origin === 'shared' ? 1 : 0;
+                return sa - sb || a[1] - b[1];
+            })
+            .map(pair => pair[0]);
 
         const selfN = spaceVoices.filter(v => v._origin !== 'shared').length;
         const sharedN = spaceVoices.length - selfN;
@@ -2832,9 +2904,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             return;
         }
         listEl.innerHTML = '';
-        spaceSelectedIds.clear();
-        // 默认只勾选「你自己创建的」（方案甲）
-        visible.forEach(v => { if (myUsername && v.creator_username === myUsername) spaceSelectedIds.add(v.voice_id); });
+        spaceSelectedIds.clear();      // 默认不勾选任何行：删除后重渲染也不再全选自生成
         mvUpdateSelectionUI();
 
         const frag = document.createDocumentFragment();
@@ -2846,12 +2916,11 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             const lang = v.language || '';
             const eng = mvEngineInfo(v.default_voice_engine);
             const isShared = v._origin === 'shared';
-            const checked = myUsername && v.creator_username === myUsername;
 
             const row = document.createElement('div');
             row.className = 'hvt-mv-row';
             row.innerHTML = `
-                <input type="checkbox" class="hvt-mv-chk" title="选择删除/下载" ${checked ? 'checked' : ''}>
+                <input type="checkbox" class="hvt-mv-chk" title="选择删除/下载">
                 <button class="hvt-mv-play-btn" data-mv-id="${esc(id)}" title="试听（首次加载后长期缓存；Shift+点击强制重新加载）">
                     <svg class="ic-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/></svg>
                     <svg class="ic-stop" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>
@@ -2873,6 +2942,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             });
             row.querySelector('.hvt-mv-play-btn').addEventListener('click', (e) => mvTogglePlay(v, e.shiftKey));
             mvBindCopyRename(row, v, !!(myUsername && v.creator_username === myUsername), spacePersistCache);
+            mvBindRowCopy(row, v);
             row.querySelector('.hvt-mv-dl-btn').addEventListener('click', () => mvDownloadOne(v));
             frag.appendChild(row);
         });
@@ -2910,7 +2980,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             } catch (e) { failed++; }
             if (i < targets.length - 1 && !spaceDelAbort) await mvShareSleep(1500 + Math.random() * 1500);
         }
-        try { localStorage.setItem(SPACE_CACHE_KEY, JSON.stringify({ ts: Date.now(), voices: spaceVoices, members: [...spaceMembers] })); } catch {}
+        spacePersistCache();
         spaceDelRunning = false;
         mvRenderList();
         const tail = spaceDelAbort ? '（已停止）' : '';
@@ -3056,13 +3126,15 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         try {
             const d = await heygenApi('/v1/space/user.list?include_superadmins=true', { headers: { 'x-space-id': spaceId } });
             const arr = Array.isArray(d) ? d : (d.list || d.users || []); // user.list 的 data 直接是数组
-            return arr.map(u => u.username).filter(Boolean);
+            return arr.filter(u => u.username);
         } catch { return []; }
     }
 
-    // creator ∈ Space 成员 → 自生成；否则分享进来。
-    // 成员名单暂未取到时，用 shared_to 是否含邮箱兜底判定。
+    // creator === 当前账号 → 自生成（与实际删除权限一致）；否则分享进来。
+    // myUsername 尚未取到时，退化用「creator ∈ Space 成员」/ shared_to 是否含邮箱兜底判定
+    // （仅为展示用近似值，不影响实际删除仍按 creator_username === myUsername 严格校验）。
     function classifyOrigin(v) {
+        if (myUsername) return v.creator_username === myUsername ? 'self' : 'shared';
         if (spaceMembers.size) return spaceMembers.has(v.creator_username) ? 'self' : 'shared';
         const keys = Object.keys(v.spaces_or_users_shared_to || {});
         return keys.some(k => k.includes('@')) ? 'shared' : 'self';
@@ -3078,7 +3150,10 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
 
             const memberSet = new Set();
             for (const sp of spacesList) {
-                (await fetchSpaceMembers(sp.id)).forEach(u => memberSet.add(u));
+                (await fetchSpaceMembers(sp.id)).forEach(u => {
+                    memberSet.add(u.username);
+                    if (u.email) spaceMemberEmails.set(u.username, u.email);
+                });
                 await mvShareSleep(600 + Math.random() * 600);
             }
             spaceMembers = memberSet;
@@ -3113,7 +3188,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 }
             }
             spaceVoices = collected;
-            try { localStorage.setItem(SPACE_CACHE_KEY, JSON.stringify({ ts: Date.now(), voices: collected, members: [...spaceMembers] })); } catch {}
+            spacePersistCache();
 
             // 面板已打开 → 刷新展示
             const aisOverlay = document.getElementById('hvt-ais-overlay');
@@ -3135,7 +3210,10 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             spaceVoices = c.voices;
             spaceMembers = new Set(c.members || []);
         }
-        setTimeout(spacePrefetch, 3000);
+        // 缓存新鲜（24h 内）→ 直接用缓存、不后台全量重扫；缺失或过期才自动拉。想要最新点 ↺ 强制刷新。
+        if (!c || Date.now() - (c.ts || 0) >= SPACE_CACHE_TTL) {
+            setTimeout(spacePrefetch, 3000);
+        }
     }
 
     // ─── Project Videos（找我的视频）──────────────────────────────────────────
@@ -5220,13 +5298,14 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 <div style="display:flex;align-items:center;gap:8px">
                   <span id="hvt-mv-count" style="font-size:13px;color:#8b8abf"></span>
                   <span id="hvt-mv-sel-count" style="font-size:13px;color:#a78bfa"></span>
-                  <button id="hvt-mv-space-toggle" class="hvt-btn" title="切换显示：本号自带声音 / 社区（Space）声音">🌐 社区声音</button>
-                  <button id="hvt-mv-exp" class="hvt-btn" title="分享到期清理：撤销超过设定天数的对外分享">⏰ 到期清理</button>
-                  <button id="hvt-mv-refresh" class="hvt-btn" title="刷新列表">↺ 刷新</button>
-                  <button id="hvt-mv-audio-clear" class="hvt-btn" title="清空所有已缓存的试听音频（单个声音可 Shift+点击试听按钮单独刷新）">🧹 试听缓存</button>
+                  <button id="hvt-mv-space-toggle" class="hvt-btn hvt-btn-icon" title="切换显示：本号自带声音 / 社区（Space）声音">🌐</button>
+                  <button id="hvt-mv-exp" class="hvt-btn hvt-btn-icon" title="分享到期清理：撤销超过设定天数的对外分享">⏰</button>
+                  <button id="hvt-mv-refresh" class="hvt-btn hvt-btn-icon" title="刷新列表">↺</button>
+                  <button id="hvt-mv-audio-clear" class="hvt-btn hvt-btn-icon" title="清空所有已缓存的试听音频（单个声音可 Shift+点击试听按钮单独刷新）">🧹</button>
+                  <button id="hvt-mv-clear-sel" class="hvt-btn hvt-btn-icon" title="取消全选" style="display:none">✕选</button>
                   <button id="hvt-mv-dl-sel" class="hvt-btn hvt-btn-primary" title="下载已勾选的声音" style="display:none">⬇ 下载已选</button>
                   <button id="hvt-mv-del-sel" class="hvt-btn hvt-btn-danger" title="删除已勾选、且是你自己创建的声音（不可逆）" style="display:none">🗑 删除选中</button>
-                  <button id="hvt-mv-dl-all" class="hvt-btn" title="下载全部声音 MP3">⬇ 全部下载</button>
+                  <button id="hvt-mv-dl-all" class="hvt-btn hvt-btn-icon" title="下载全部声音 MP3">⬇</button>
                   <button id="hvt-mv-close" title="关闭">✕</button>
                 </div>
               </div>
@@ -5829,6 +5908,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         document.getElementById('hvt-mv-search').addEventListener('input', mvRenderList);
         document.getElementById('hvt-mv-dl-all').addEventListener('click', mvDownloadSelected);
         document.getElementById('hvt-mv-dl-sel').addEventListener('click', mvDownloadSelected);
+        document.getElementById('hvt-mv-clear-sel').addEventListener('click', mvClearSelection);
         document.getElementById('hvt-mv-del-sel').addEventListener('click', () => {
             if (mvDelRunning || spaceDelRunning) { mvDelAbort = true; spaceDelAbort = true; if (mvShareWaitCancel) mvShareWaitCancel(); }
             else mvDeleteSelected();

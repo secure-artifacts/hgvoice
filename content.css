@@ -1019,7 +1019,7 @@ td.hvt-copied { animation: hvt-copy-flash 0.55s ease-out; }
     background: #fff;
     border-radius: 14px;
     box-shadow: 0 8px 40px rgba(37,99,235,0.18);
-    width: 640px;
+    width: 760px;
     max-width: 95vw;
     max-height: 80vh;
     display: flex;
@@ -1052,6 +1052,20 @@ td.hvt-copied { animation: hvt-copy-flash 0.55s ease-out; }
 }
 #hvt-mv-header .hvt-btn:hover { background: rgba(255,255,255,0.28); }
 
+/* 纯图标按钮：靠 title 提供说明文字，避免头部一整排「图标+文字」按钮挤在一起 */
+#hvt-mv-header .hvt-btn-icon {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    font-size: 13px;
+    line-height: 1;
+    flex-shrink: 0;
+}
+
 #hvt-mv-close {
     width: 28px;
     height: 28px;
@@ -1081,8 +1095,8 @@ td.hvt-copied { animation: hvt-copy-flash 0.55s ease-out; }
 .hvt-mv-row {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 7px 10px;
+    gap: 10px;
+    padding: 8px 12px;
     border-radius: 8px;
     border: 1px solid #e2e8f0;
     background: #fafafa;
@@ -1184,7 +1198,7 @@ td.hvt-copied { animation: hvt-copy-flash 0.55s ease-out; }
 .hvt-mv-gender {
     font-size: 13px;
     flex-shrink: 0;
-    width: 18px;
+    width: 16px;
     text-align: center;
 }
 
@@ -1192,6 +1206,9 @@ td.hvt-copied { animation: hvt-copy-flash 0.55s ease-out; }
     font-size: 12px;
     color: #64748b;
     flex-shrink: 0;
+    width: 66px;
+    box-sizing: border-box;
+    text-align: center;
     background: #f1f5f9;
     border-radius: 4px;
     padding: 1px 6px;
@@ -1201,6 +1218,9 @@ td.hvt-copied { animation: hvt-copy-flash 0.55s ease-out; }
     font-size: 11px;
     font-weight: 600;
     flex-shrink: 0;
+    width: 52px;
+    box-sizing: border-box;
+    text-align: center;
     border-radius: 4px;
     padding: 1px 6px;
     white-space: nowrap;
@@ -1222,11 +1242,23 @@ td.hvt-copied { animation: hvt-copy-flash 0.55s ease-out; }
 .hvt-sp-origin.hvt-sp-self   { color: #15803d; background: #dcfce7; }
 .hvt-sp-origin.hvt-sp-shared { color: #c2410c; background: #ffedd5; }
 
+/* 我的声音：来源色点（无文字，hover 显示 title）—— 绿=本账号创建，橙=其他账号分享给本账号 */
+.hvt-mv-origin-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.hvt-mv-origin-dot.hvt-origin-self   { background: #22c55e; }
+.hvt-mv-origin-dot.hvt-origin-shared { background: #f97316; }
+
 .hvt-mv-id {
     font-family: monospace;
     font-size: 11px;
     color: #94a3b8;
     flex-shrink: 0;
+    width: 128px;
+    box-sizing: border-box;
     cursor: pointer;
 }
 .hvt-mv-id:hover { color: #4f46e5; }
