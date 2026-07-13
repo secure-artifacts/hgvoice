@@ -2270,6 +2270,37 @@ td.hvt-copied { animation: hvt-copy-flash 0.55s ease-out; }
     overflow-y: auto;
 }
 
+.hvt-bp-log-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.hvt-bp-log-ops {
+    display: inline-flex;
+    gap: 6px;
+}
+#hvt-bp-log {
+    margin-top: 6px;
+    max-height: 180px;
+    overflow-y: auto;
+    background: #0f172a;
+    color: #cbd5e1;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.hvt-bp-log-line { padding: 0; }
+.hvt-bp-log-error { color: #fca5a5; }
+.hvt-bp-log-info  { color: #cbd5e1; }
+#hvt-bp-log:empty::before {
+    content: '暂无日志';
+    color: #64748b;
+}
+
 .hvt-bp-empty {
     color: #94a3b8;
     font-size: 13px;

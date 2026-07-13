@@ -4232,6 +4232,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     let bpPollTimer    = null;   // 轮询 setInterval 句柄
     let bpRunning      = false;
     let bpCurrentTask  = null;   // 正在执行链路的任务 id（防重入）
+    let bpPreflighting = false;  // 预审阶段进行中（防重入）
 
     function bpLoadDb() {
         try { bpDb = JSON.parse(localStorage.getItem(BP_DB_KEY)) || null; } catch { bpDb = null; }
@@ -4239,14 +4240,63 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         bpDb.settings = Object.assign({
             voiceId: '', forceIII: true,
             spaceId: '',                        // 提交到哪个 Space（'' = 个人）
+            groupName: '',                      // 整批共享头像组的名称（空 = 自动「批量-日期」）
             orientation: 'portrait', resolution: '720p',
             intervalMin: 3, intervalMax: 8,     // 分钟
             hourlyCap: 10, scheduleAt: '', autoDownload: true,
         }, bpDb.settings || {});
-        bpDb.tasks = bpDb.tasks || [];           // {id,title,script,voiceId,status,groupId,draftId,videoUrl,error,submittedAt,hasImg}
+        bpDb.tasks = bpDb.tasks || [];           // {id,title,script,voiceId,status,lookId,draftId,videoUrl,error,submittedAt}
+        bpDb.groupId = bpDb.groupId || '';       // 整批共享的头像组 id（预审阶段建立）
+        bpDb.log = Array.isArray(bpDb.log) ? bpDb.log : [];  // 运行日志（{t,level,title,msg}，尾部封顶）
         bpDb.running = !!bpDb.running;
     }
     function bpSaveDb() { localStorage.setItem(BP_DB_KEY, JSON.stringify(bpDb)); }
+
+    // ── 运行日志：面板实时展示 + 可下载排查 ──
+    const BP_LOG_CAP = 800;
+    function bpLog(level, msg, task) {
+        const e = { t: Date.now(), level, title: task ? (task.title || task.id) : '', msg: String(msg) };
+        bpDb.log.push(e);
+        if (bpDb.log.length > BP_LOG_CAP) bpDb.log.splice(0, bpDb.log.length - BP_LOG_CAP);
+        bpSaveDb();
+        bpAppendLogLine(e);
+        return e;
+    }
+    function bpLogLineText(e) {
+        const ts = new Date(e.t).toLocaleTimeString('zh-CN', { hour12: false });
+        return `${ts} [${e.level}]${e.title ? ' 〈' + e.title + '〉' : ''} ${e.msg}`;
+    }
+    function bpAppendLogLine(e) {
+        const box = document.getElementById('hvt-bp-log');
+        if (!box) return;
+        const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+        const div = document.createElement('div');
+        div.className = 'hvt-bp-log-line hvt-bp-log-' + e.level;
+        div.textContent = bpLogLineText(e);
+        box.appendChild(div);
+        while (box.childNodes.length > BP_LOG_CAP) box.removeChild(box.firstChild);
+        if (atBottom) box.scrollTop = box.scrollHeight;
+    }
+    function bpRenderLog() {
+        const box = document.getElementById('hvt-bp-log');
+        if (!box) return;
+        box.innerHTML = bpDb.log.map(e =>
+            `<div class="hvt-bp-log-line hvt-bp-log-${e.level}">${esc(bpLogLineText(e))}</div>`
+        ).join('');
+        box.scrollTop = box.scrollHeight;
+    }
+    function bpDownloadLog() {
+        if (!bpDb.log.length) { showToast('暂无日志', 'error'); return; }
+        const text = bpDb.log.map(bpLogLineText).join('\n');
+        const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `批量流水线日志-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+    }
+    function bpClearLog() { bpDb.log = []; bpSaveDb(); bpRenderLog(); }
 
     // ── IndexedDB：任务图片持久化（localStorage 放不下 base64） ──
     function bpIdbOpen() {
@@ -4289,8 +4339,10 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         return sid ? { 'x-space-id': sid } : {};
     }
 
-    // ── 头像：图片 blob → photo avatar group_id ──
-    async function bpCreateAvatar(blob, name) {
+    // ── 上传一张图为 look：temp.create → PUT S3 → temp.convert ──
+    // groupId 为空 = 新建组（返回的 group_id 即主 look 的 look_id）；
+    // groupId 非空 = 追加 look 到该组（convert 只回 group_id，新 look_id 由调用方 diff look.list 认领）。
+    async function bpUploadLook(blob, name, groupId) {
         const t = await heygenApi('/v1/avatar_group/photo/temp.create?num_photos=1', { headers: bpSpaceHeaders() });
         const putUrl = t.upload_urls && t.upload_urls[0];
         const s3Url  = t.s3_urls && t.s3_urls[0];
@@ -4301,7 +4353,6 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             body: blob,
         });
         if (!up.ok) throw new Error(`图片上传失败 HTTP ${up.status}`);
-        // s3 路径形如 …/temporary_user_photar/<id>/image.jpg
         const idMatch = s3Url.match(/temporary_user_photar\/([0-9a-f]{32})/i);
         if (!idMatch) throw new Error('解析临时图片 ID 失败: ' + s3Url);
         const q = new URLSearchParams({
@@ -4309,15 +4360,29 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             ethnicity: 'Unspecified', gender: 'Unspecified', age: 'Unspecified',
             name, skip_validation: 'true',
         });
+        if (groupId) q.set('group_id', groupId);   // 带 group_id = 追加到已有组
         const conv = await heygenApi(`/v1/avatar_group/photo/temp.convert?${q}`, { headers: bpSpaceHeaders() });
-        if (!conv.group_id) throw new Error('创建头像未返回 group_id');
+        if (!conv.group_id) throw new Error('创建/追加头像未返回 group_id');
         return conv.group_id;
     }
 
-    // ── 提交渲染：Avatar Shots 通道，一步直达 ──
-    async function bpShortcutSubmit(task, groupId) {
+    // 拉取整组全部 look 的状态（一次覆盖全组）
+    async function bpFetchLooks(groupId) {
+        const d = await heygenApi(
+            `/v2/avatar_group/look.list?group_id=${groupId}&type=all&page=1&limit=100`,
+            { headers: bpSpaceHeaders() },
+        );
+        return ((d && d.avatar_looks) || []).map(x => ({
+            lookId: x.look.id, status: x.look.status,
+            moderation_msg: x.look.moderation_msg, created_at: x.look.created_at || 0,
+        }));
+    }
+
+    // ── 提交渲染：Avatar Shots 通道，按 look_id 定位出片 ──
+    async function bpShortcutSubmit(task) {
         const voiceId = task.voiceId || bpDb.settings.voiceId;
         if (!voiceId) throw new Error('未指定声音 ID');
+        if (!task.lookId) throw new Error('缺 look id（未完成预审）');
         const iii = bpDb.settings.forceIII;
         const d = await heygenApi('/v2/avatar/shortcut/submit', {
             method: 'POST', headers: bpSpaceHeaders(),
@@ -4325,7 +4390,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 video_title: task.title,
                 video_orientation: bpDb.settings.orientation,
                 resolution: bpDb.settings.resolution,
-                avatar_id: groupId,
+                avatar_id: task.lookId,   // ← 传 look_id，渲染指定那个 look
                 source_type: 'avatar_video_shortcut_modal',
                 fit: 'cover',
                 audio_data: { audio_type: 'tts_pending', text: task.script, voice_id: voiceId },
@@ -4338,30 +4403,119 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         return d.video_id;
     }
 
-    // ── 单任务全链路 ──
-    async function bpRunTask(task) {
-        const step = async (status) => { task.status = status; bpSaveDb(); bpRenderTasks(); };
-        try {
-            await step('创建头像中');
-            if (!task.groupId) {
+    // ── 预审阶段：整批建一个组 → 逐张追加 look → 一次性等全组审核出结果 ──
+    // completed 置「待渲染」进入渲染队列；failed / 有 moderation_msg 置「失败」直接踢出，不进渲染。
+    async function bpPreflight() {
+        const groupName = (bpDb.settings.groupName || '').trim() || `批量-${new Date().toISOString().slice(0, 10)}`;
+        const needUpload = () => bpDb.tasks.filter(t => !t.lookId && ['待提交', '上传中', '审核中'].includes(t.status));
+        if (!needUpload().length && !bpDb.tasks.some(t => t.status === '审核中')) return;
+
+        // 1) 建组（用第一张待上传图）
+        if (!bpDb.groupId) {
+            const first = needUpload()[0];
+            if (!first) return;
+            first.status = '上传中'; bpSaveDb(); bpRenderTasks();
+            bpSetStatusLine(`预审：建组「${groupName}」…`);
+            try {
+                const blob = await bpIdbGet(first.id);
+                if (!blob) throw new Error('任务图片丢失，请删除后重新添加');
+                const gid = await bpUploadLook(blob, groupName, '');
+                bpDb.groupId = gid; first.lookId = gid; first.status = '审核中';
+                bpLog('info', `建组成功 group=${gid.slice(0, 8)}…（主 look 已上传）`, first);
+            } catch (e) {
+                first.status = '失败'; first.error = e.message;
+                bpLog('error', '建组失败：' + e.message, first);
+            }
+            bpSaveDb(); bpRenderTasks();
+        }
+
+        // 2) 逐张追加其余 look
+        const known = new Set(bpDb.tasks.filter(t => t.lookId).map(t => t.lookId));
+        const rest = needUpload();
+        let n = 0;
+        for (const task of rest) {
+            if (!bpDb.groupId) break;
+            task.status = '上传中'; bpSaveDb(); bpRenderTasks();
+            bpSetStatusLine(`预审：上传造型 ${++n}/${rest.length}…`);
+            try {
                 const blob = await bpIdbGet(task.id);
                 if (!blob) throw new Error('任务图片丢失，请删除后重新添加');
-                task.groupId = await bpCreateAvatar(blob, task.title);
-                bpSaveDb();
+                await bpUploadLook(blob, task.title, bpDb.groupId);
+                const looks = await bpFetchLooks(bpDb.groupId);
+                const fresh = looks.filter(l => !known.has(l.lookId))
+                                   .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))[0];
+                if (!fresh) throw new Error('追加造型后未能定位新 look id');
+                task.lookId = fresh.lookId; known.add(fresh.lookId); task.status = '审核中';
+                bpLog('info', `造型已上传 look=${fresh.lookId.slice(0, 8)}…`, task);
+            } catch (e) {
+                task.status = '失败'; task.error = e.message;
+                bpLog('error', '上传造型失败：' + e.message, task);
             }
-            await step('提交渲染中');
-            task.draftId = await bpShortcutSubmit(task, task.groupId);   // draftId 字段存渲染中的 video_id
-            task.submittedAt = Date.now();
-            await step('生成中');
-        } catch (e) {
-            task.error = e.message;
-            await step('失败');
+            bpSaveDb(); bpRenderTasks();
         }
+
+        // 3) 一次性等全组审核出结果
+        await bpWaitLooksReady();
+    }
+
+    // 轮询整组 look.list，把「审核中」任务按 lookId 落地为 待渲染 / 失败
+    async function bpWaitLooksReady() {
+        const pending = () => bpDb.tasks.filter(t => t.status === '审核中' && t.lookId);
+        if (!pending().length || !bpDb.groupId) return;
+        const TIMEOUT_MS = 180_000, INTERVAL_MS = 30_000;
+        const deadline = Date.now() + TIMEOUT_MS;
+        bpSetStatusLine('预审：等待审核结果…');
+        while (pending().length) {
+            let looks;
+            try { looks = await bpFetchLooks(bpDb.groupId); }
+            catch (e) {
+                bpLog('error', '查询审核状态失败：' + e.message);
+                if (Date.now() >= deadline) break;
+                await new Promise(r => setTimeout(r, INTERVAL_MS)); continue;
+            }
+            const byId = new Map(looks.map(l => [l.lookId, l]));
+            for (const t of pending()) {
+                const l = byId.get(t.lookId);
+                if (!l) continue;
+                if (l.status === 'completed') {
+                    t.status = '待渲染'; bpLog('info', '审核通过 → 待渲染', t);
+                } else if (l.status === 'failed' || l.moderation_msg) {
+                    t.status = '失败'; t.error = '审核未通过：' + (l.moderation_msg || l.status);
+                    bpLog('error', t.error, t);
+                }
+            }
+            bpSaveDb(); bpRenderTasks();
+            if (!pending().length) break;
+            if (Date.now() >= deadline) {
+                for (const t of pending()) { t.status = '失败'; t.error = '审核超时未完成'; bpLog('error', '审核超时', t); }
+                bpSaveDb(); bpRenderTasks(); break;
+            }
+            await new Promise(r => setTimeout(r, INTERVAL_MS));
+        }
+        const ok = bpDb.tasks.filter(t => t.status === '待渲染').length;
+        const bad = bpDb.tasks.filter(t => t.status === '失败').length;
+        bpSetStatusLine(`预审完成：待渲染 ${ok} 条，失败 ${bad} 条`);
+        bpLog('info', `预审完成：待渲染 ${ok}，失败 ${bad}`);
+    }
+
+    // ── 渲染阶段：对「待渲染」任务按 look_id 提交出片 ──
+    async function bpRunTask(task) {
+        try {
+            task.status = '提交渲染中'; bpSaveDb(); bpRenderTasks();
+            task.draftId = await bpShortcutSubmit(task);   // draftId 存渲染中的 video_id
+            task.submittedAt = Date.now();
+            task.status = '生成中';
+            bpLog('info', `已提交渲染 video=${task.draftId.slice(0, 8)}…`, task);
+        } catch (e) {
+            task.status = '失败'; task.error = e.message;
+            bpLog('error', '提交渲染失败：' + e.message, task);
+        }
+        bpSaveDb(); bpRenderTasks();
     }
 
     // ── 提交调度：串行 + 随机间隔 + 每小时限额 + 定时启动 ──
     function bpNextPending() {
-        return bpDb.tasks.find(t => t.status === '待提交');
+        return bpDb.tasks.find(t => t.status === '待渲染');
     }
     function bpSubmittedInLastHour() {
         const cutoff = Date.now() - 3600_000;
@@ -4386,11 +4540,23 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
 
     async function bpWorkerTick() {
         bpWorkerTimer = null;
-        if (!bpRunning) return;
+        if (!bpRunning || bpPreflighting) return;
 
+        // 阶段①：有「待提交」（待上传）或「审核中」任务 → 先跑预审（建组+追加+等审核）
+        if (bpDb.tasks.some(t => t.status === '待提交' || t.status === '审核中')) {
+            bpPreflighting = true;
+            try { await bpPreflight(); }
+            catch (e) { bpLog('error', '预审异常：' + e.message); bpSetStatusLine('预审异常：' + e.message); }
+            bpPreflighting = false;
+            if (!bpRunning) return;
+            bpWorkerTimer = setTimeout(bpWorkerTick, 50);   // 预审完 → 进渲染队列
+            return;
+        }
+
+        // 阶段②：渲染队列（只提「待渲染」）
         const task = bpNextPending();
         if (!task) {
-            bpSetStatusLine('队列中已无待提交任务（轮询下载仍在运行）');
+            bpSetStatusLine('队列已空（生成中的任务仍在轮询下载）');
             return;
         }
         const capped = bpSubmittedInLastHour() >= (Number(bpDb.settings.hourlyCap) || Infinity);
@@ -4400,7 +4566,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             return;
         }
         bpCurrentTask = task.id;
-        bpSetStatusLine(`正在提交：${task.title}`);
+        bpSetStatusLine(`正在提交渲染：${task.title}`);
         await bpRunTask(task);
         bpCurrentTask = null;
 
@@ -4450,9 +4616,18 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     }
 
     // ── 生成状态轮询 + 自动下载 ──
+    // 渲染耗时长（分钟级，队列繁忙可能更久），故首轮等 30 分钟再查，之后每 10 分钟一次。
+    // 重载续跑时：已提交超过 30 分钟的任务立即补查一次，避免旧视频白等一整个首轮。
     function bpEnsurePoller() {
         if (bpPollTimer) return;
-        bpPollTimer = setInterval(bpPollTick, 60_000);
+        const FIRST_MS = 30 * 60_000, EVERY_MS = 10 * 60_000;
+        const subs = bpDb.tasks.filter(t => t.status === '生成中' && t.submittedAt).map(t => t.submittedAt);
+        const oldest = subs.length ? Math.min(...subs) : Date.now();
+        const firstDelay = Math.max(0, Math.min(FIRST_MS, FIRST_MS - (Date.now() - oldest)));
+        bpPollTimer = setTimeout(function start() {
+            bpPollTick();
+            bpPollTimer = setInterval(bpPollTick, EVERY_MS);
+        }, firstDelay);
     }
     async function bpPollTick() {
         const watching = bpDb.tasks.filter(t => t.status === '生成中' && t.draftId);
@@ -4463,11 +4638,13 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 if (d.status === 'completed' && d.video_url) {
                     task.videoUrl = d.video_url;
                     task.status = bpDb.settings.autoDownload ? '下载中' : '已完成';
+                    bpLog('info', '渲染完成' + (bpDb.settings.autoDownload ? '，开始下载' : ''), task);
                     bpSaveDb(); bpRenderTasks();
                     if (bpDb.settings.autoDownload) bpDownload(task);
                 } else if (d.status === 'failed') {
                     task.status = '失败';
                     task.error = d.error_message || '服务端渲染失败';
+                    bpLog('error', '渲染失败：' + task.error, task);
                     bpSaveDb(); bpRenderTasks();
                 }
             } catch (e) { /* 单次轮询失败忽略，下轮再试 */ }
@@ -4480,7 +4657,8 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             { type: 'hvt_download', url: task.videoUrl, filename: `${safe}.mp4` },
             (res) => {
                 task.status = (res && res.ok) ? '已下载' : '已完成';
-                if (!(res && res.ok)) task.error = '自动下载失败，可手动点击下载';
+                if (res && res.ok) { bpLog('info', '已下载', task); }
+                else { task.error = '自动下载失败，可手动点击下载'; bpLog('error', task.error, task); }
                 bpSaveDb(); bpRenderTasks();
             }
         );
@@ -4595,7 +4773,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             bpDb.tasks.push({
                 id, title: file.name.replace(/\.[^.]+$/, ''), script: it.english,
                 voiceId, status: '待提交',
-                groupId: '', draftId: '', videoUrl: '', error: '', submittedAt: 0,
+                lookId: '', draftId: '', videoUrl: '', error: '', submittedAt: 0,
             });
         }
         bpSaveDb();
@@ -4643,7 +4821,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             bpDb.tasks.push({
                 id, title: scripts[i].title || baseName, script: scripts[i].script,
                 voiceId: '', status: '待提交',
-                groupId: '', draftId: '', videoUrl: '', error: '', submittedAt: 0,
+                lookId: '', draftId: '', videoUrl: '', error: '', submittedAt: 0,
             });
         }
         bpSaveDb();
@@ -4713,6 +4891,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     function bpSyncSettingsFromUI() {
         const g = (id) => document.getElementById(id);
         bpDb.settings.spaceId     = g('hvt-bp-space').value;
+        bpDb.settings.groupName   = g('hvt-bp-gname').value.trim();
         bpDb.settings.voiceId     = g('hvt-bp-voice').value.trim();
         bpDb.settings.orientation = g('hvt-bp-orient').value;
         bpDb.settings.resolution  = g('hvt-bp-res').value;
@@ -4728,6 +4907,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         const s = bpDb.settings;
         const g = (id) => document.getElementById(id);
         g('hvt-bp-space').value   = s.spaceId;
+        g('hvt-bp-gname').value   = s.groupName;
         g('hvt-bp-voice').value   = s.voiceId;
         g('hvt-bp-orient').value  = s.orientation;
         g('hvt-bp-res').value     = s.resolution;
@@ -4770,11 +4950,12 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
               </div>
               <div id="hvt-bp-body">
                 <div class="hvt-bp-section">
-                  <div class="hvt-bp-sec-title">① 默认参数（走 Avatar Shots 通道，Avatar III 不占用生成额度）</div>
+                  <div class="hvt-bp-sec-title">① 默认参数（整批共建 1 个头像组，逐造型审核；走 Avatar Shots 通道，Avatar III 不占额度）</div>
                   <div class="hvt-bp-line">
                     <label>Space
                       <select id="hvt-bp-space" class="hvt-input"><option value="">个人</option></select>
                     </label>
+                    <label title="整批共用的头像组名称，留空自动用「批量-日期」">组名 <input id="hvt-bp-gname" class="hvt-input" placeholder="批量-日期"></label>
                     <label>声音ID <input id="hvt-bp-voice" class="hvt-input" placeholder="默认 voice_id"></label>
                     <label>画幅
                       <select id="hvt-bp-orient" class="hvt-input">
@@ -4823,6 +5004,15 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                   <div class="hvt-bp-sec-title">④ 任务队列</div>
                   <div id="hvt-bp-list"></div>
                 </div>
+                <div class="hvt-bp-section">
+                  <div class="hvt-bp-sec-title hvt-bp-log-title">⑤ 运行日志
+                    <span class="hvt-bp-log-ops">
+                      <button id="hvt-bp-log-dl" class="hvt-btn" title="导出全部日志为 txt">下载日志</button>
+                      <button id="hvt-bp-log-clear" class="hvt-btn" title="清空日志">清空</button>
+                    </span>
+                  </div>
+                  <div id="hvt-bp-log" title="预审/上传/审核/渲染/下载的实时记录，出错时含具体报错"></div>
+                </div>
               </div>
             </div>`;
         document.body.appendChild(root);
@@ -4831,9 +5021,12 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         g('hvt-bp-close').addEventListener('click', () => { root.style.display = 'none'; });
         root.addEventListener('click', (e) => { if (e.target === root) root.style.display = 'none'; });
 
-        ['hvt-bp-space', 'hvt-bp-voice', 'hvt-bp-orient', 'hvt-bp-res', 'hvt-bp-force3', 'hvt-bp-autodl',
+        ['hvt-bp-space', 'hvt-bp-gname', 'hvt-bp-voice', 'hvt-bp-orient', 'hvt-bp-res', 'hvt-bp-force3', 'hvt-bp-autodl',
          'hvt-bp-int-min', 'hvt-bp-int-max', 'hvt-bp-cap', 'hvt-bp-schedule']
             .forEach(id => g(id).addEventListener('change', bpSyncSettingsFromUI));
+
+        g('hvt-bp-log-dl').addEventListener('click', bpDownloadLog);
+        g('hvt-bp-log-clear').addEventListener('click', bpClearLog);
 
         // 选图后立即显示顺序预览条，便于与文案顺序核对
         g('hvt-bp-imgs').addEventListener('change', () => {
@@ -4931,7 +5124,8 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 if (thumb) { URL.revokeObjectURL(thumb); bpThumbCache.delete(task.id); }
                 bpSaveDb(); bpRenderTasks();
             } else if (e.target.classList.contains('hvt-bp-retry')) {
-                task.status = '待提交'; task.error = '';
+                // 重试：清掉 lookId 走完整预审（重新上传+审核），保证审核失败/渲染失败都能干净重跑
+                task.status = '待提交'; task.lookId = ''; task.draftId = ''; task.error = '';
                 bpSaveDb(); bpRenderTasks(); bpKick();
             } else if (e.target.classList.contains('hvt-bp-dl')) {
                 bpDownload(task);
@@ -4957,6 +5151,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         bpFillSettingsUI();
         bpPopulateSpaces();
         bpRenderTasks();
+        bpRenderLog();
         bpUpdateRunButtons();
         root.style.display = 'flex';
     }
@@ -4964,11 +5159,12 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     function bpInit() {
         bpLoadDb();
         bpBuildUI();
-        // 中断恢复：上次处于运行态 → 自动续跑；卡在中间态的任务重置
+        // 中断恢复：上次处于运行态 → 自动续跑；卡在中间态的任务按有无 lookId/draftId 归位
+        // （'审核中' 有 lookId、'生成中' 有 draftId 的保持原状，续跑时分别由预审轮询/下载轮询接管）
         for (const t of bpDb.tasks) {
-            if (['创建头像中', '构建草稿中', '提交渲染中', '下载中'].includes(t.status)) {
-                t.status = t.draftId ? '生成中' : '待提交';
-            }
+            if (t.status === '上传中')        t.status = t.lookId ? '审核中' : '待提交';
+            else if (t.status === '提交渲染中') t.status = t.draftId ? '生成中' : (t.lookId ? '待渲染' : '待提交');
+            else if (t.status === '下载中')    t.status = t.videoUrl ? '已完成' : (t.draftId ? '生成中' : '待渲染');
         }
         bpSaveDb();
         if (bpDb.tasks.some(t => t.status === '生成中')) bpEnsurePoller();

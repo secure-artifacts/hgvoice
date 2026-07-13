@@ -140,23 +140,28 @@
 
 ### 七、批量流水线（免 UI 提交视频）
 
-不打开 HeyGen 编辑器，直接通过 API 批量做视频：每个任务 = 一张图片（自动创建 Photo Avatar）+ 一条文案 + 声音 ID，从提交到下载全程无需人工操作界面。
+不打开 HeyGen 编辑器，直接通过 API 批量做视频：每个任务 = 一张图片 + 一条文案 + 声音 ID，从提交到下载全程无需人工操作界面。**整批共建 1 个头像组**，每张图作为组内一个「造型（look）」，先统一过审核、只把通过的送去出片。
 
 **功能**
 - 悬浮按钮组里的影片图标打开「批量流水线」面板
 - **走 Avatar Shots 通道**：Avatar III + 无限模式，不占用月度生成秒数额度（平台另有每日生成上限）
-- **默认参数**：Space、默认声音 ID、画幅（竖屏 9:16 / 横屏 16:9）、分辨率（720p / 1080p）、Avatar III 开关
+- **默认参数**：Space、**组名**（整批共用，留空自动「批量-日期」）、默认声音 ID、画幅（竖屏 9:16 / 横屏 16:9）、分辨率（720p / 1080p）、Avatar III 开关
+- **两阶段流水线**：① 预审——整批建 1 个组、逐张追加为 look、统一等平台构建/审核；② 渲染——只对**审核通过**的 look 按其 `look_id` 出片。审核不通过 / 被平台拒的造型直接标失败、**不进渲染队列**，且不影响其余任务
+- **运行日志**：面板底部实时滚动记录（预审 / 上传 / 审核 / 渲染 / 下载 + 具体报错），可一键**下载日志**为 txt 便于排查
 - **批量添加任务**：一次选多张图片（原图上传）+ 粘贴等量文案，自动一一配对；选图后有序号预览条。支持配套「口播工具 / AvatarReelsHelper」（<https://avatar-reels-helper-76842936864.us-west1.run.app/>，需访问码）导出的 `copy.tsv`（`#N#` 与图片文件名前导编号精确配对，自动带 `voice_id`），也支持谷歌表格整行/空行分段/每行一条（按文件名排序后顺序配对）
 - 文案支持**谷歌表格整行粘贴**：每行一条，两列时第 1 列作标题、第 2 列作文案；也支持空行分段 / 每行一条
 - 任务列表显示头像缩略图；**⇅ 调换按钮**可把文案与相邻行对调（图片不动），修正配对错位
 - **串行提交**：随机间隔（区间设定，如 3~8 分钟）、每小时提交上限、定时启动
-- **自动下载**：每分钟轮询生成状态，完成后自动下载 MP4（也可手动点下载）
-- 队列与图片本地持久化（localStorage + IndexedDB），关页后重开自动续跑；失败任务一键重试（已建好的头像不重复创建）
+- **自动下载**：完成后自动下载 MP4（也可手动点下载）
+- 队列与图片本地持久化（localStorage + IndexedDB），关页后重开自动续跑；失败任务一键重试（清掉旧造型走完整预审，审核/渲染失败都能干净重跑）
 
 **接口链路**
-- 图片 → 头像：`avatar_group/photo/temp.create` → PUT S3 → `photo/temp.convert` → `group_id`
-- 提交渲染：`POST /v2/avatar/shortcut/submit`（带 `use_unlimited_mode:true` + `source_type:"avatar_video_shortcut_modal"`）一步返回 `video_id`
+- 建组（第一张）：`avatar_group/photo/temp.create` → PUT S3 → `photo/temp.convert` → `group_id`（主 look 的 `look_id` == `group_id`）
+- 追加造型（其余张）：`photo/temp.convert?…&group_id=<组>`，把每张图作为新 look 加入同一组（新 `look_id` 由 `look.list` 比对认领）
+- 审核状态：轮询 `GET /v2/avatar_group/look.list?group_id=…`，逐 look 读 `status`（pending→completed）与 `moderation_msg`
+- 提交渲染：`POST /v2/avatar/shortcut/submit`，`avatar_id` 传**目标 `look_id`**（按指定造型出片）+ `use_unlimited_mode:true` + `source_type:"avatar_video_shortcut_modal"`，返回 `video_id`
 - 轮询 `pacific/video.get` 至 `completed` 后取签名 `video_url` 下载
+- 轮询节奏：审核每 30s（超时 180s）；渲染进度首轮 30 分钟、之后每 10 分钟
 - ⚠ 勿走 AI Studio 的 `text_draft.generate` 做整片生成：会被标记 `low_priority` + 未付费，月额度用尽时永远排不上队
 
 **注意**
@@ -186,6 +191,13 @@
 ---
 
 ## 版本记录
+
+### v1.15.0
+- **批量流水线改「一组多 look」两阶段**：整批共建 1 个头像组，每张图作为组内一个造型（`temp.convert` 带 `group_id` 追加）；先统一过审核（`look.list` 逐 look 出 `pending→completed`），**只把审核通过的按 `look_id` 送去出片**，不通过 / 被拒的直接标失败不进渲染，且不影响其余任务。根因：`temp.convert` 返回 `group_id` 后平台异步跑构建/审核（look 未 `completed` 前提交渲染会报 `Photar has status 'pending'`），故改为预审通过再出片
+- **组名可自定义**：整批共用组名，留空自动「批量-日期」
+- **运行日志**：面板新增实时日志区（预审/上传/审核/渲染/下载 + 具体报错），可一键下载 txt 排查
+- **失败隔离**：任一任务上传/审核/渲染失败只标该条失败并自动跳过，不阻断后续任务
+- **轮询节奏**：审核每 30s（超时 180s）；渲染进度首轮 30 分钟、之后每 10 分钟（少发请求；重载续跑时对已提交超 30 分钟的任务立即补查）
 
 ### v1.14.1
 - **AIS 换声音新增兜底**：目标是有效声音、但原生弹窗虚拟列表未渲染出该行（如社区分享声音、被搜索/标签页遮蔽）时，回退复用已捕获的 `onSelect` + 缓存声音对象切换；仍由「点确认按钮 + 轮询弹窗关闭」校验兜底——切换未真正生效则如实报失败，不会假成功（恢复 1.14 之前的可切换能力，同时保留防假成功约束）
