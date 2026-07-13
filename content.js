@@ -3985,8 +3985,12 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
 
         setStatus('正在切换声音…');
 
-        // A cached voice object can return success without error while leaving the
-        // original voice selected — always require a real modal row selection.
+        // Prefer a real, rendered modal row (visibleOnly): safest, and avoids the
+        // "假成功" where a cached object is accepted without the voice actually changing.
+        // The native list is virtualized, so a valid voice may simply not be rendered
+        // (scrolled out / other tab / not surfaced by search) — for that case we fall
+        // back to the cached object below (visibleOnly:false), guarded by the
+        // confirm+close verification so a non-applying selection still reports failure.
         const bridgeOpts = { visibleOnly: true };
 
         // Try current (first) tab — bridge handles modal search internally if needed
@@ -4008,6 +4012,16 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 if (!result.success) result = await aisExpandOpenModalUntilFound(targetVoiceId, bridgeOpts);
                 if (result.success) break;
             }
+        }
+
+        // Last-resort fallback (restores pre-1.14 capability): the target is a valid
+        // voice whose row the virtualized native modal never rendered and no tab/search
+        // surfaced. Reuse the captured onSelect with the cached voice object. The
+        // confirm+close verification below still guards against a fake success: if the
+        // selection does not really change, the confirm button stays disabled and the
+        // dialog won't close, so we report failure instead of a false ✅.
+        if (!result.success) {
+            result = await aisBridgeSwitchUntil(targetVoiceId, { visibleOnly: false }, 1500);
         }
 
         if (result.success) {
