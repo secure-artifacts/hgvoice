@@ -109,9 +109,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg.type === 'hvt_notify') {
+        chrome.notifications.create({
+            type: 'basic', iconUrl: 'icon.png',
+            title: msg.title || '人声筛选工具',
+            message: msg.message || '',
+        }, () => sendResponse({ ok: !chrome.runtime.lastError }));
+        return true;
+    }
     if (msg.type === 'hvt_download') {
         chrome.downloads.download(
-            { url: msg.url, filename: msg.filename, saveAs: false },
+            { url: msg.url, filename: msg.filename, saveAs: false, conflictAction: msg.conflictAction || 'uniquify' },
             (downloadId) => {
                 if (chrome.runtime.lastError) {
                     sendResponse({ ok: false, error: chrome.runtime.lastError.message });

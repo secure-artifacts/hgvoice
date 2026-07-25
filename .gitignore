@@ -1,5 +1,6 @@
 .DS_Store
 *.zip
 .playwright-mcp/
+panel-snapshot.yml
 .claude/worktrees/
 docs/screenshots/
