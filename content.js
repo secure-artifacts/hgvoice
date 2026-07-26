@@ -213,6 +213,8 @@
     let mvDelRunning = false;      // batch-delete in progress
     let mvDelAbort = false;        // set by 停止 to break the delete loop
     let mvShareVoice = null; // voice currently targeted by the share dialog
+    let mvShareBatch = [];   // 多声音批量共享：非空表示弹框处于「N 个声音 × M 个邮箱」模式
+    let mvShareRunning = false; // 批量共享进行中（按钮变「停止」）
     let mvShareDone = []; // emails successfully shared in the current share-dialog session
     let mvShareAbort = false; // set by 停止 to break the batch-remove loop
     let mvShareWaitCancel = null; // cancels the in-progress inter-delete delay
@@ -2066,8 +2068,34 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         return [...new Set(matches)];
     }
 
+    // 多声音批量共享：N 个声音 × M 个邮箱。已共享列表在此模式下不显示（各声音各不相同，
+    // 合并展示会误导；要管理单个声音的已共享名单仍走单声音弹框）。
+    function mvOpenShareBatch(voices) {
+        if (!voices.length) return;
+        mvShareVoice = null;
+        mvShareBatch = voices;
+        mvShareDone = [];
+        const overlay = document.getElementById('hvt-mv-share-overlay');
+        if (!overlay) return;
+        const names = voices.map(v => v.display_name || v.voice_id || '');
+        const voiceEl = document.getElementById('hvt-mv-share-voice');
+        voiceEl.innerHTML = `共享 <b>${voices.length}</b> 个声音：`
+            + `<span style="color:#94a3b8">${esc(names.slice(0, 6).join('、'))}${names.length > 6 ? ` …等 ${names.length} 个` : ''}</span>`;
+        voiceEl.style.cursor = 'default';
+        voiceEl.title = names.join('\n');
+        voiceEl.onclick = null;
+        const ta = document.getElementById('hvt-mv-share-ta');
+        const status = document.getElementById('hvt-mv-share-status');
+        if (ta) ta.value = '';
+        if (status) status.textContent = `将对每个邮箱依次共享这 ${voices.length} 个声音`;
+        document.getElementById('hvt-mv-share-done').style.display = 'none';
+        overlay.style.display = 'flex';
+        if (ta) ta.focus();
+    }
+
     async function mvOpenShare(v) {
         mvShareVoice = v;
+        mvShareBatch = [];
         mvShareDone = [];
         const overlay = document.getElementById('hvt-mv-share-overlay');
         if (!overlay) return;
@@ -2115,8 +2143,10 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
 
     function mvCloseShare() {
         const overlay = document.getElementById('hvt-mv-share-overlay');
+        if (mvShareRunning) { mvShareAbort = true; if (mvShareWaitCancel) mvShareWaitCancel(); }
         if (overlay) overlay.style.display = 'none';
         mvShareVoice = null;
+        mvShareBatch = [];
         mvShareDone = [];
     }
 
@@ -2152,43 +2182,63 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         if (selAll) selAll.checked = false;
     }
 
+    // 单声音（mvShareVoice）与多声音（mvShareBatch）共用：展开成 (声音 × 邮箱) 任务串行执行
     async function mvShareGo() {
-        if (!mvShareVoice) return;
         const ta = document.getElementById('hvt-mv-share-ta');
         const status = document.getElementById('hvt-mv-share-status');
         const btn = document.getElementById('hvt-mv-share-go');
-        const emails = mvExtractEmails(ta.value).filter(e => !mvShareDone.includes(e));
-
+        if (mvShareRunning) {                     // 运行中再点 = 停止
+            mvShareAbort = true;
+            if (mvShareWaitCancel) mvShareWaitCancel();
+            return;
+        }
+        const voices = mvShareBatch.length ? mvShareBatch : (mvShareVoice ? [mvShareVoice] : []);
+        if (!voices.length) return;
+        const single = !mvShareBatch.length;
+        // 单声音模式下已共享过的邮箱直接跳过；多声音模式各声音名单不同，不做过滤
+        const emails = mvExtractEmails(ta.value).filter(e => !single || !mvShareDone.includes(e));
         if (!emails.length) { status.textContent = '⚠️ 未检测到有效邮箱（或都已共享）'; return; }
 
-        const voiceId = mvShareVoice.voice_id || '';
-        btn.disabled = true;
+        const jobs = [];
+        for (const email of emails) for (const v of voices) jobs.push({ email, v });
+
+        mvShareRunning = true; mvShareAbort = false;
+        const oldLabel = btn.textContent;
         let shared = 0, failed = 0;
 
-        for (let i = 0; i < emails.length; i++) {
-            status.textContent = `共享中 ${i + 1}/${emails.length}…`;
+        for (let i = 0; i < jobs.length; i++) {
+            if (mvShareAbort) break;
+            const { email, v } = jobs[i];
+            btn.textContent = `■ 停止 (${i + 1}/${jobs.length})`;
+            status.textContent = single
+                ? `共享中 ${i + 1}/${jobs.length}…`
+                : `共享中 ${i + 1}/${jobs.length}：${v.display_name || v.voice_id} → ${email}`;
             try {
                 await heygenApi('/v1/share_resources', {
                     method: 'POST',
                     body: JSON.stringify({
                         resource_type: 'VOICE',
-                        resource_id: voiceId,
-                        destination_email_address: emails[i],
+                        resource_id: v.voice_id || '',
+                        destination_email_address: email,
                     }),
                 });
                 shared++;
-                mvShareDone.push(emails[i]);
-                mvShareRenderDone();
+                if (single) { mvShareDone.push(email); mvShareRenderDone(); }
             } catch (e) {
                 failed++;
             }
             // 4~8 秒随机延迟，避免操作太快被服务器拒绝
-            if (i < emails.length - 1) await new Promise(r => setTimeout(r, 4000 + Math.random() * 4000));
+            if (i < jobs.length - 1 && !mvShareAbort) await mvShareSleep(4000 + Math.random() * 4000);
         }
 
-        status.textContent = failed > 0 ? `✅ 已共享 ${shared} 个，${failed} 个失败` : `✅ 已共享 ${shared} 个`;
-        if (shared > 0) ta.value = '';
-        btn.disabled = false;
+        const tail = mvShareAbort ? '（已停止）' : '';
+        const scope = single ? '' : `（${voices.length} 个声音 × ${emails.length} 个邮箱）`;
+        status.textContent = (failed > 0
+            ? `✅ 成功 ${shared} 条，${failed} 条失败${scope}`
+            : `✅ 已共享 ${shared} 条${scope}`) + tail;
+        if (shared > 0 && !failed && !mvShareAbort) ta.value = '';
+        mvShareRunning = false;
+        btn.textContent = oldLabel;
     }
 
     // 可被「停止」立即打断的等待
@@ -2715,6 +2765,11 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         const n = mvActiveSel().size;
         dlSelBtn.style.display = n > 0 ? 'inline-flex' : 'none';
         dlSelBtn.textContent = `⬇ 下载已选 (${n})`;
+        const shareSelBtn = document.getElementById('hvt-mv-share-sel');
+        if (shareSelBtn) {
+            shareSelBtn.style.display = n > 0 ? 'inline-flex' : 'none';
+            shareSelBtn.textContent = `🔗 共享选中 (${n})`;
+        }
         const delSelBtn = document.getElementById('hvt-mv-del-sel');
         if (delSelBtn) {
             delSelBtn.style.display = n > 0 ? 'inline-flex' : 'none';
@@ -4877,10 +4932,8 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         bpDb.running = true;
         bpSaveDb();
         bpUpdateRunButtons();
-        // 配对已定稿 → 自动生成归档文件夹（同名覆盖，重复启动无副作用；失败只记日志不阻塞提交）
-        if (bpDb.tasks.some(t => t.status === '待提交')) {
-            bpGenerateArchive(true).catch(e => bpLog('error', '生成归档文件夹失败：' + e.message));
-        }
+        // 归档在两条导入路径里已各自生成过，这里不再重复触发（会额外产生一批下载条目）；
+        // 需要重出归档用面板的「归档」按钮。
         const delay = bpScheduleDelayMs();
         if (delay > 0) {
             bpSetStatusLine(`定时启动：${new Date(Date.now() + delay).toLocaleString()}`);
@@ -4965,9 +5018,19 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     }
     const bpBatchLabel = (bid) => bpDb.batchNames[bid]
         || ((bpDb.settings.groupName || '').trim() || `批量-${new Date().toISOString().slice(0, 10)}`);
-    const bpBatchDir = (bid) => bpBatchLabel(bid).replace(/[\\/:*?"<>|]/g, '_');
+    // chrome.downloads 的单个路径分量：非法字符外，结尾的点/空格与超长（>255 字节，中文 1 字 3 字节）均报 Invalid filename
+    const bpSafePart = (s, max = 60, fallback = '_') => {
+        const t = String(s || '')
+            .replace(/[\x00-\x1f\x7f]/g, '')
+            .replace(/[\\/:*?"<>|]/g, '_')
+            .trim()
+            .slice(0, max)
+            .replace(/^[.\s]+|[.\s]+$/g, '');
+        return t || fallback;
+    };
+    const bpBatchDir = (bid) => bpSafePart(bpBatchLabel(bid), 80, '批量');
     function bpDownload(task) {
-        const safe = (bpFinalTitle(task) || task.draftId).replace(/[\\/:*?"<>|]/g, '_');
+        const safe = bpSafePart(bpFinalTitle(task) || task.draftId, 80, task.draftId || 'video');
         chrome.runtime.sendMessage(
             { type: 'hvt_download', url: task.videoUrl, filename: `${bpBatchDir(task.batchId)}/${safe}.mp4` },
             (res) => {
@@ -5063,7 +5126,6 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     async function bpGenerateArchive(onlyPending = false, onlyBatch = null) {
         if (!bpDb.tasks.length) { showToast('队列为空，无可归档', 'error'); return; }
         const clean = (s) => String(s || '').replace(/[\t\n\r]/g, ' ').trim();
-        const sanitize = (s) => clean(s).replace(/[\\/:*?"<>|]/g, '_');
         const byBatch = new Map();
         for (const t of bpDb.tasks) {
             const bid = t.batchId || 'legacy';
@@ -5088,8 +5150,8 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 const n = i + 1;
                 const blob = await bpIdbGet(t.id).catch(() => null);
                 if (!blob) { showToast(`批次 ${bid} 第 ${n} 行图片丢失，无法归档`, 'error', 4000); return; }
-                const label = sanitize(t.chinese || clean(t.title).replace(/^\d+[_\-. ]*/, ''));
-                await bpArchiveFile(`${dir}/images/${n}_${label || 'img'}.jpg`, await bpBlobDataUrl(blob));
+                const label = bpSafePart(clean(t.chinese) || clean(t.title).replace(/^\d+[_\-. ]*/, ''), 60, 'img');
+                await bpArchiveFile(`${dir}/images/${n}_${label}.jpg`, await bpBlobDataUrl(blob));
                 lines.push(`#${n}#\t${clean(t.chinese)}\t${clean(t.script)}`);
                 imgs++;
             }
@@ -5154,19 +5216,26 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     async function bpImportArhTasks(files, arh) {
         const byId = new Map(arh.items.map(it => [it.id, it]));
         const pairs = [];
+        const skipped = [];
         for (const f of files) {
             const m = f.name.match(/^(\d+)[_\-.]/);
-            if (!m) { showToast(`图片「${f.name}」文件名无前导编号，无法与 #N# 配对`, 'error', 5000); return; }
+            if (!m) { skipped.push(f.name); continue; }       // 无前导编号 → 跳过，不阻断
             const it = byId.get(parseInt(m[1], 10));
-            if (!it) { showToast(`图片「${f.name}」找不到对应的 #${m[1]}# 文案`, 'error', 5000); return; }
+            if (!it) { skipped.push(f.name); continue; }      // 编号无对应文案 → 跳过
             if (!it.english) { showToast(`#${it.id}# 缺英文文案`, 'error', 5000); return; }
             if (bpHasChinese(it.english)) { showToast(`#${it.id}# 英文文案混入中文，已拦截导入，请先修正 copy.tsv`, 'error', 6000); return; }
             pairs.push({ file: f, it });
         }
-        if (pairs.length !== arh.items.length) {
-            showToast(`图片 ${pairs.length} 张 ≠ 文案 ${arh.items.length} 条，请一一对应`, 'error', 4500);
+        if (!pairs.length) {
+            showToast(`没有任何图片能与 #N# 配对（共 ${files.length} 张），请检查文件名前导编号`, 'error', 5000);
             return;
         }
+        if (pairs.length < arh.items.length) {
+            const missing = arh.items.filter(it => !pairs.some(p => p.it.id === it.id)).map(it => `#${it.id}#`);
+            showToast(`以下文案缺图片：${missing.join(' ')}，请补齐后再导入`, 'error', 6000);
+            return;
+        }
+        if (skipped.length) showToast(`已跳过 ${skipped.length} 张无法配对的图片：${skipped.slice(0, 3).join('、')}${skipped.length > 3 ? ' 等' : ''}`, 'info', 5000);
         {   // 同批文案完全重复 → 大概率错行，警告但不拦截
             const seen = new Map();
             for (const it of arh.items) {
@@ -6530,6 +6599,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                   <button id="hvt-mv-audio-clear" class="hvt-btn hvt-btn-icon" title="清空所有已缓存的试听音频（单个声音可 Shift+点击试听按钮单独刷新）">🧹</button>
                   <button id="hvt-mv-clear-sel" class="hvt-btn hvt-btn-icon" title="取消全选" style="display:none">✕选</button>
                   <button id="hvt-mv-dl-sel" class="hvt-btn hvt-btn-primary" title="下载已勾选的声音" style="display:none">⬇ 下载已选</button>
+                  <button id="hvt-mv-share-sel" class="hvt-btn" title="把已勾选的声音一次性共享给一个或多个邮箱" style="display:none">🔗 共享选中</button>
                   <button id="hvt-mv-del-sel" class="hvt-btn hvt-btn-danger" title="删除已勾选、且是你自己创建的声音（不可逆）" style="display:none">🗑 删除选中</button>
                   <button id="hvt-mv-dl-all" class="hvt-btn hvt-btn-icon" title="下载全部声音 MP3">⬇</button>
                   <button id="hvt-mv-close" title="关闭">✕</button>
@@ -7135,6 +7205,12 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         document.getElementById('hvt-mv-dl-all').addEventListener('click', mvDownloadSelected);
         document.getElementById('hvt-mv-dl-sel').addEventListener('click', mvDownloadSelected);
         document.getElementById('hvt-mv-clear-sel').addEventListener('click', mvClearSelection);
+        document.getElementById('hvt-mv-share-sel').addEventListener('click', () => {
+            const ids = [...mvActiveSel()];
+            const voices = mvActiveVoices().filter(v => ids.includes(v.voice_id || ''));
+            if (!voices.length) { showToast('未找到选中的声音', 'error'); return; }
+            mvOpenShareBatch(voices);
+        });
         document.getElementById('hvt-mv-del-sel').addEventListener('click', () => {
             if (mvDelRunning || spaceDelRunning) { mvDelAbort = true; spaceDelAbort = true; if (mvShareWaitCancel) mvShareWaitCancel(); }
             else mvDeleteSelected();
