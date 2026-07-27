@@ -2595,3 +2595,44 @@ td.hvt-copied { animation: hvt-copy-flash 0.55s ease-out; }
 .hvt-bp-grid .hvt-bp-grid-del { width: 24px; text-align: center; cursor: pointer; color: #b0b4ba; border-left: none; }
 .hvt-bp-grid .hvt-bp-grid-del:hover { color: #e0524d; }
 .hvt-bp-grid td:last-child { white-space: nowrap; }
+
+/* ── 已暂停任务常驻提示条 + 导入询问弹框 ── */
+.hvt-bp-paused-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 6px 0 8px;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: #92400e;
+    background: #fffbeb;
+    border: 1px solid #fcd34d;
+    border-radius: 6px;
+}
+.hvt-bp-paused-bar span { flex: 1; }
+.hvt-bp-paused-bar b { font-size: 13px; }
+.hvt-bp-paused-bar .hvt-btn { flex: none; white-space: nowrap; }
+
+.hvt-bp-ask {
+    position: fixed;
+    inset: 0;
+    z-index: 2147483647;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(15, 23, 42, .45);
+    pointer-events: all;   /* #hvt-root 是 pointer-events:none，挂到它下面时按钮会点不动 */
+}
+.hvt-bp-ask-card {
+    width: 380px;
+    max-width: calc(100vw - 40px);
+    padding: 18px 20px;
+    background: #fff;
+    border-radius: 10px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, .28);
+    font-size: 13px;
+    color: #1f2937;
+}
+.hvt-bp-ask-title { font-size: 15px; font-weight: 700; margin-bottom: 8px; }
+.hvt-bp-ask-body { line-height: 1.6; color: #475569; }
+.hvt-bp-ask-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }

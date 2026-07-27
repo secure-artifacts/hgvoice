@@ -5280,8 +5280,8 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         bpSaveDb();
         bpRenderTasks();
         bpKick();
-        showToast(`已添加 ${pairs.length} 个任务（ARH 按编号配对${voiceId ? '，声音 ' + voiceId.slice(0, 8) + '…' : ''}）${bpRunning ? '，流水线运行中→已暂停，核对后点 ▶ 恢复' : ''}`, 'success', bpRunning ? 6000 : undefined);
         bpGenerateArchive(false, batchId).catch(e => bpLog('error', '自动归档失败：' + e.message));
+        bpAfterImport(batchId, pairs.length, `（ARH 按编号配对${voiceId ? '，声音 ' + voiceId.slice(0, 8) + '…' : ''}）`);
     }
 
     // ── 任务导入：多图 + 文案，按顺序配对 ──
@@ -5402,8 +5402,8 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         bpSaveDb();
         bpRenderTasks();
         bpKick();
-        showToast(`已添加 ${files.length} 个任务${bpRunning ? '（流水线运行中→已暂停，核对后点 ▶ 恢复）' : ''}`, 'success', bpRunning ? 6000 : undefined);
         bpGenerateArchive(false, batchId).catch(e => bpLog('error', '自动归档失败：' + e.message));
+        bpAfterImport(batchId, files.length);   // 不 await：弹框不阻塞导入表单清空
         return true;
     }
 
@@ -5506,6 +5506,56 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         bpThumbCache.set(taskId, url);
         return url;
     }
+    // 导入时若流水线在跑：新批次默认置「已暂停」，弹框问用户是立刻放行还是先核对
+    function bpAskJoinNow(n) {
+        return new Promise(resolve => {
+            // 挂 body 而非 #hvt-root：后者 pointer-events:none 会让按钮点不动，且最小化面板时 display:none 会带走弹框
+            const host = document.body;
+            const box = document.createElement('div');
+            box.className = 'hvt-bp-ask';
+            box.innerHTML = `
+              <div class="hvt-bp-ask-card">
+                <div class="hvt-bp-ask-title">已添加 ${n} 个任务</div>
+                <div class="hvt-bp-ask-body">流水线正在运行中。要立刻把这批任务加入提交队列，还是先核对图文配对再放行？</div>
+                <div class="hvt-bp-ask-btns">
+                  <button class="hvt-btn hvt-bp-ask-later">先检查，稍后加入</button>
+                  <button class="hvt-btn hvt-btn-primary hvt-bp-ask-now">立即加入队列</button>
+                </div>
+              </div>`;
+            host.appendChild(box);
+            const done = v => { box.remove(); resolve(v); };
+            box.querySelector('.hvt-bp-ask-now').onclick = () => done(true);
+            box.querySelector('.hvt-bp-ask-later').onclick = () => done(false);
+            box.onclick = e => { if (e.target === box) done(false); };   // 点遮罩 = 先检查（安全默认）
+        });
+    }
+    // 导入收尾：非运行中直接是「待提交」无需询问；运行中按用户选择放行或留在暂停
+    async function bpAfterImport(batchId, n, extra = '') {
+        if (!bpRunning) { showToast(`已添加 ${n} 个任务${extra}`, 'success'); return; }
+        showToast(`已添加 ${n} 个任务${extra}`, 'success');
+        if (await bpAskJoinNow(n)) {
+            bpDb.tasks.forEach(t => { if (t.batchId === batchId && t.status === '已暂停') t.status = '待提交'; });
+            bpSaveDb(); bpRenderTasks(); bpKick();
+            showToast(`${n} 个任务已加入提交队列`, 'success');
+        } else {
+            showToast(`${n} 个任务已暂停，核对后点队列顶部的「▶ 恢复全部」放行`, 'info', 8000);
+        }
+    }
+    // 常驻提示条：只要有「已暂停」任务就显示，提供整批放行入口（运行中同样可点）
+    function bpRenderPausedBar() {
+        const bar = document.getElementById('hvt-bp-paused-bar');
+        if (!bar) return;
+        const n = bpDb.tasks.filter(t => t.status === '已暂停').length;
+        if (!n) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
+        bar.style.display = '';
+        bar.innerHTML = `<span>⏸ 有 <b>${n}</b> 个任务已暂停，尚未进入提交队列；核对图文配对无误后点右侧放行</span>
+          <button id="hvt-bp-resume-all" class="hvt-btn hvt-btn-primary">▶ 恢复全部 ${n} 条</button>`;
+        bar.querySelector('#hvt-bp-resume-all').onclick = () => {
+            bpDb.tasks.forEach(t => { if (t.status === '已暂停') t.status = '待提交'; });
+            bpSaveDb(); bpRenderTasks(); bpKick();
+            showToast(`已恢复 ${n} 个任务`, 'success');
+        };
+    }
     // 渲染时在每个批次首行前插入批次头（两种视图共用）
     function bpWithBatchHeaders(tasks, rowFn) {
         let out = '', lastBid = null;
@@ -5525,7 +5575,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         if (!wrap) return;
         if (!bpDb.tasks.length) {
             wrap.innerHTML = '<div class="hvt-bp-empty">暂无任务：选择图片并粘贴对应文案后点「添加任务」</div>';
-            bpRenderProgress(); bpUpdateTrashButton();
+            bpRenderProgress(); bpUpdateTrashButton(); bpRenderPausedBar();
             return;
         }
         const last = bpDb.tasks.length - 1;
@@ -5596,6 +5646,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         });
         bpUpdateTrashButton();
         bpRenderProgress();
+        bpRenderPausedBar();
     }
     // 文案（含标题/声音ID）在两行间调换，图片和已建头像保持原位
     const bpSwappable = (t) => ['待提交', '失败', '已暂停'].includes(t.status);
@@ -5914,6 +5965,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                     <label class="hvt-bp-selall-label" title="全选/取消全选已出片的行"><input type="checkbox" id="hvt-bp-selall"> 全选</label>
                     <button id="hvt-bp-trash" class="hvt-btn hvt-bp-btn-danger" title="把勾选的平台视频移入 HeyGen 回收站（可恢复），并从队列移除对应行" disabled>🗑 删除所选视频</button>
                   </div>
+                  <div id="hvt-bp-paused-bar" class="hvt-bp-paused-bar" style="display:none"></div>
                   <div id="hvt-bp-list"></div>
                 </div>
                 <details class="hvt-bp-fold" id="hvt-bp-log-sec">
