@@ -3943,6 +3943,24 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     let aisSearchResults = [];
     let aisFallbackToken = 0; // incremented to cancel an in-flight fallback search
 
+    // 兜底跳转目标:随手可开、自带语音控件的编辑器(用户不知道链接时一键切过去)。
+    // 注意:是否"可换声音"由 DOM 探测判定(路由无关);这里的跳转 URL 是唯一保留的路由依赖,
+    // 若 HeyGen 改了此路径,只改这一处即可,不影响换声音本身的可用性判断。
+    const AIS_EDITOR_URL = '/avatar/avatar-shots';
+
+    // 页面无换声音入口时,给出可操作的提示 + 一键跳转按钮(解决"用户不知道编辑器链接"的问题)
+    function aisShowNoEntry(statusEl) {
+        if (!statusEl) return;
+        statusEl.dataset.type = 'warn';
+        statusEl.innerHTML =
+            '当前页面没有换声音入口 '
+          + '<button id="hvt-ais-goto" style="margin-left:6px;padding:2px 8px;border-radius:6px;'
+          + 'border:1px solid currentColor;background:transparent;color:inherit;cursor:pointer;'
+          + 'font:inherit;white-space:nowrap">→ 打开 Avatar Shots 编辑器</button>';
+        const goto = statusEl.querySelector('#hvt-ais-goto');
+        if (goto) goto.onclick = () => location.assign(AIS_EDITOR_URL);
+    }
+
     // ── Language-independent UI matchers ─────────────────────────────────────
     // HeyGen localizes every button label (en / 简体 / 繁體 / …), so matching on
     // English text breaks the moment the user changes language. We anchor on
@@ -4000,6 +4018,25 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             if (btn) return btn;
         }
         return null;
+    }
+
+    // AI Studio 语音行:可点击、圆角带边框、且不含 <img>(头像行才有 img)。
+    // 实测 /create-v4/ 页面精确命中 1 个,用作路由无关的入口信号。
+    function aisFindAIStudioVoiceRow() {
+        return [...document.querySelectorAll('div.tw-cursor-pointer')]
+            .filter(el => !el.closest('#hvt-root') && !el.closest('#hvt-fab-strip') &&
+                el.className.includes('tw-rounded-md') && el.className.includes('tw-border'))
+            .find(el => !el.querySelector('img')) || null;
+    }
+
+    // 当前页面是否存在"换声音"入口 —— 取代写死的 /avatar/ + /create-v4/ 白名单,
+    // 复用已有的语言无关探测器;HeyGen 改路由/改样式都不影响判断。
+    function aisVoiceEntryPresent() {
+        return !!(aisIsModalOpen()
+            || aisFindAvatarShotsVoiceBtn()
+            || aisFindAvatarVoiceMenuBtn()
+            || aisFindAIStudioVoiceRow()
+            || [...document.querySelectorAll('button')].some(isSwitchEl));
     }
 
     function aisTargetVoiceObj(targetVoiceId) {
@@ -4106,64 +4143,54 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             statusEl.dataset.type = type;
         };
 
-        const isAvatarShots = location.pathname.includes('/avatar/');
-        const isAIStudio   = location.pathname.includes('/create-v4/');
-        if (!isAvatarShots && !isAIStudio) {
-            setStatus('请在 AI Studio 或 Avatar Shots 页面使用', 'error');
-            return;
-        }
-
-        setStatus('正在打开切换窗口…');
-
         if (!aisIsModalOpen()) {
-            if (isAvatarShots) {
+            // 入口探测取代写死的 URL 白名单:直接看页面上有没有换声音入口,改版换路由都不受影响。
+            const shotsBtn  = aisFindAvatarShotsVoiceBtn();
+            const menuBtn   = aisFindAvatarVoiceMenuBtn();
+            const studioRow = (!shotsBtn && !menuBtn) ? aisFindAIStudioVoiceRow() : null;
+            let   switchBtn = (!shotsBtn && !menuBtn) ? [...document.querySelectorAll('button')].find(isSwitchEl) : null;
+
+            if (!shotsBtn && !menuBtn && !studioRow && !switchBtn) {
+                aisShowNoEntry(statusEl);   // 无入口 → 提示 + 一键跳转编辑器
+                return;
+            }
+
+            setStatus('正在打开切换窗口…');
+
+            if (shotsBtn || menuBtn) {
                 let opened = false;
                 // 路径一 — Avatar Shots 编辑器：Voice 工具栏按钮(#audio) → Voice 弹窗 → Switch
-                const voiceToolbarBtn = aisFindAvatarShotsVoiceBtn();
-                if (voiceToolbarBtn) {
-                    voiceToolbarBtn.click();
+                if (shotsBtn) {
+                    shotsBtn.click();
                     await new Promise(r => setTimeout(r, 400));
                     const switchInModal = [...document.querySelectorAll('[role="dialog"][data-state="open"] button')]
                         .find(isSwitchEl);
                     if (switchInModal) { switchInModal.click(); opened = true; }
                 }
                 // 路径二 — My Avatars 详情页：顶部声音下拉 → 菜单「Switch voice」
-                if (!opened) {
-                    const menuBtn = aisFindAvatarVoiceMenuBtn();
-                    if (menuBtn) {
-                        menuBtn.click();
-                        await new Promise(r => setTimeout(r, 350));
-                        const switchItem = [...document.querySelectorAll('[role="menuitem"], [role="menu"] button')]
-                            .find(isSwitchEl);
-                        if (switchItem) { switchItem.click(); opened = true; }
-                    }
+                if (!opened && menuBtn) {
+                    menuBtn.click();
+                    await new Promise(r => setTimeout(r, 350));
+                    const switchItem = [...document.querySelectorAll('[role="menuitem"], [role="menu"] button')]
+                        .find(isSwitchEl);
+                    if (switchItem) { switchItem.click(); opened = true; }
                 }
                 if (!opened) {
                     setStatus('未找到声音入口，请确认在 Avatar Shots 或头像详情页', 'error');
                     return;
                 }
             } else {
-                // AI Studio: find Switch button directly, or navigate from Avatar & Voice panel
-                let heySwitchBtn = [...document.querySelectorAll('button')].find(isSwitchEl);
-
-                if (!heySwitchBtn) {
-                    // Voice row has no <img> (avatar row does); both share tw-cursor-pointer + tw-rounded-md
-                    const voiceRow = [...document.querySelectorAll('div.tw-cursor-pointer')]
-                        .filter(el => !el.closest('#hvt-root') && !el.closest('#hvt-fab-strip') &&
-                            el.className.includes('tw-rounded-md') && el.className.includes('tw-border'))
-                        .find(el => !el.querySelector('img'));
-                    if (voiceRow) {
-                        voiceRow.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                        await new Promise(r => setTimeout(r, 400));
-                        heySwitchBtn = [...document.querySelectorAll('button')].find(isSwitchEl);
-                    }
+                // AI Studio: Switch 按钮直达,或点语音行后再找 Switch(语音行无 <img>,头像行才有)
+                if (!switchBtn && studioRow) {
+                    studioRow.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                    await new Promise(r => setTimeout(r, 400));
+                    switchBtn = [...document.querySelectorAll('button')].find(isSwitchEl);
                 }
-
-                if (!heySwitchBtn) {
+                if (!switchBtn) {
                     setStatus('未找到 Switch 按钮，请先在 AI Studio 选中 Avatar 场景', 'error');
                     return;
                 }
-                heySwitchBtn.click();
+                switchBtn.click();
             }
 
             let waited = 0;
@@ -4399,9 +4426,12 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         aisSearchVoices('');
         const statusEl = document.getElementById('hvt-ais-status');
         if (statusEl) {
-            const onSupportedPage = location.pathname.includes('/create-v4/') || location.pathname.includes('/avatar/');
-            statusEl.textContent = onSupportedPage ? '' : '⚠️ 请在 AI Studio 或 Avatar Shots 页面使用';
-            statusEl.dataset.type = onSupportedPage ? '' : 'warn';
+            if (aisVoiceEntryPresent()) {
+                statusEl.textContent = '';
+                statusEl.dataset.type = '';
+            } else {
+                aisShowNoEntry(statusEl);
+            }
         }
     }
 
@@ -7401,7 +7431,8 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     let engineCooldownUntil = 0;    // 失败后的退避截止时间
 
     const forceIIIEnabled = () => localStorage.getItem(FORCE_III_KEY) !== '0';
-    const onEnginePage    = () => location.pathname.includes('/avatar/') || location.pathname.includes('/create-v4/');
+    // 不再靠 URL 判断"是否引擎页";真正的信号是 findDowngradeButton()——
+    // 找得到 Avatar IV/V 引擎按钮才有活可干,找不到就跳过。路由改了也不影响。
 
     // 引擎选择器是 Radix DropdownMenu：触发器在 pointerdown 打开，菜单项也按指针事件选中。
     // 真实页面验证：单纯 el.click() 不会打开菜单，必须补 pointerdown/pointerup。
@@ -7475,7 +7506,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     }
 
     async function enforceAvatarIII(manual = false) {
-        if (!forceIIIEnabled() || !onEnginePage() || engineSwitching) return false;
+        if (!forceIIIEnabled() || engineSwitching) return false;
         const btn = findDowngradeButton();
         if (!btn) {
             engineAttempts = 0;                                // 无需处理时重置失败计数
@@ -7538,7 +7569,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             engineDebounce = setTimeout(enforceAvatarIII, 300);
         };
         const obs = new MutationObserver(() => {
-            if (!onEnginePage() || engineSwitching) return;
+            if (engineSwitching) return;
             tick();
         });
         obs.observe(document.body, { childList: true, subtree: true, characterData: true });
