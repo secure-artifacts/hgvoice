@@ -7,8 +7,8 @@
 
     const cleanText = (el) => (el && el.textContent || '').trim().replace(/\s+/g, ' ');
     const isEngineText = (text) => /^Avatar\s+(?:III|IV|V)(?:\s+Avatar\s+(?:III|IV|V))*$/i.test(text);
-    const isDowngradeEngine = (text) => isEngineText(text) && /\bAvatar\s+(?:IV|V)\b/i.test(text);
-    const isAvatarIIIItem = (text) => /\bAvatar\s+III\b/i.test(text) && !/\bAvatar\s+(?:IV|V)\b/i.test(text);
+    // 菜单项文本会把名称和英文描述无空格拼接（如 "Avatar IIILip syncs…"），尾部禁用 \b 词边界
+    const isAvatarIIIItem = (text) => /\bAvatar\s+III/i.test(text) && !/\bAvatar\s+(?:IV|V)/i.test(text);
 
     function reactPropSources(el) {
         const out = [];
@@ -67,30 +67,23 @@
         return tried;
     }
 
+    // 派发一套会冒泡的原生指针+click 序列。React 用事件委托（在 document 根监听），
+    // 故冒泡的原生 click 能触发组件 onClick——无需在元素上找到 React prop。
+    // 用于 Avatar Shots 等菜单项不是 role=menuitem、也没有可枚举 React handler 的场景。
+    // 仅用于“菜单项”（非 toggle 触发器），多次点击也只是选中+关闭，安全。
     function nativeActivate(el) {
         const fire = (type, Ctor = MouseEvent) => el.dispatchEvent(new Ctor(type, {
-            bubbles: true,
-            cancelable: true,
-            composed: true,
-            button: 0,
+            bubbles: true, cancelable: true, composed: true, button: 0,
             buttons: type === 'pointerdown' || type === 'mousedown' ? 1 : 0,
-            pointerType: 'mouse',
-            view: window,
+            pointerType: 'mouse', view: window,
         }));
         try { el.focus && el.focus(); } catch {}
-        fire('pointermove', PointerEvent);
-        fire('mousemove', MouseEvent);
-        fire('pointerdown', PointerEvent);
-        fire('mousedown', MouseEvent);
-        fire('pointerup', PointerEvent);
-        fire('mouseup', MouseEvent);
+        fire('pointerover', PointerEvent); fire('pointerenter', PointerEvent);
+        fire('pointermove', PointerEvent); fire('mousemove', MouseEvent);
+        fire('pointerdown', PointerEvent); fire('mousedown', MouseEvent);
+        fire('pointerup', PointerEvent); fire('mouseup', MouseEvent);
         fire('click', MouseEvent);
         try { el.click && el.click(); } catch {}
-    }
-
-    function findEngineButton() {
-        return [...document.querySelectorAll('button')]
-            .find(b => !b.closest('#hvt-root') && !b.closest('#hvt-fab-strip') && isDowngradeEngine(cleanText(b))) || null;
     }
 
     function findAvatarIIIItem() {
@@ -175,19 +168,20 @@
         }));
     });
 
-    document.addEventListener('hvt-engine-force-iii', () => {
+    // 打开引擎下拉由 content.js 负责（合成 pointerClick 打开 Radix 触发器可靠）；
+    // 这里只在“已打开的菜单”里选中 Avatar III 项。合成 PointerEvent 对 Radix 菜单项
+    // 不触发选中，必须调用其 React onClick，故走 MAIN world。
+    document.addEventListener('hvt-engine-select-iii', () => {
         const before = engineCurrentText();
         try {
-            let item = findAvatarIIIItem();
-            if (!item) {
-                const btn = findEngineButton();
-                if (btn) {
-                    try { callReactHandlers(btn); } catch {}
-                    nativeActivate(btn);
-                }
+            // 优先激活 content.js 已定位并打标记的确切菜单项（跨页面选择器差异都能覆盖）；
+            // 无标记时才退回自身的 role 限定查找。
+            let item = document.querySelector('[data-hvt-eng-iii]');
+            if (item) {
+                item = item.closest('[role="menuitem"],[role="option"],[role="menuitemradio"],[data-radix-collection-item],button,li,[tabindex]') || item;
+            } else {
                 item = findAvatarIIIItem();
             }
-
             if (!item) {
                 document.dispatchEvent(new CustomEvent('hvt-engine-result', {
                     detail: { success: false, before, after: engineCurrentText(), error: 'no-avatar-iii-item' }
@@ -195,12 +189,23 @@
                 return;
             }
 
-            const tried = callReactHandlers(item);
-            nativeActivate(item);
+            // 诊断：回传标记元素及祖先链结构，定位真正可点的行与处理器
+            const short = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().slice(0, 45);
+            const chain = [];
+            for (let cur = item, d = 0; cur && d < 12 && !(cur.getAttribute && cur.getAttribute('role') === 'menu'); cur = cur.parentElement, d++) {
+                const fkey = Object.keys(cur).find(k => k.startsWith('__reactFiber'));
+                let handlers = [];
+                if (fkey) { let f = cur[fkey], dd = 0; for (; f && dd < 3; f = f.return, dd++) { const p = f.memoizedProps; if (p) handlers = handlers.concat(Object.keys(p).filter(k => /^on[A-Z]/.test(k) && typeof p[k] === 'function')); } }
+                chain.push({ d, tag: cur.tagName, role: cur.getAttribute && cur.getAttribute('role'), cls: short(cur.className), cursor: getComputedStyle(cur).cursor, fiber: !!fkey, on: [...new Set(handlers)] });
+            }
+            const menuOpen = !!document.querySelector('[role="menu"]');
+
+            const tried = callReactHandlers(item);        // Radix 项：直接调 React prop
+            nativeActivate(item);                         // 普通项：原生冒泡经 React 委托触发
             setTimeout(() => {
                 const after = engineCurrentText();
                 document.dispatchEvent(new CustomEvent('hvt-engine-result', {
-                    detail: { success: /\bAvatar\s+III\b/i.test(after), before, after, tried }
+                    detail: { success: /\bAvatar\s+III/i.test(after), before, after, tried, nativeAlso: true, menuOpen, chain }
                 }));
             }, 500);
         } catch (err) {

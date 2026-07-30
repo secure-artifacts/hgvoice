@@ -7421,9 +7421,13 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     // 文本含 "Avatar III"。下拉结构运行时自适应：广选择器 + 文本匹配定位选项。
     const FORCE_III_KEY   = 'hvt_force_avatar_iii';   // '1' 开启(默认) / '0' 关闭
     const ENGINE_EXACT_RE = /^(?:Avatar\s+(?:II|III|IV|V)\s*)+$/i; // 纯引擎名（排除"最近创作"等长文本）
-    const AVATAR_IV_RE    = /\bAvatar\s+IV\b/i;
-    const AVATAR_V_RE     = /\bAvatar\s+V\b/i;   // "Avatar IV" 不会误命中（IV 内 V 前无词边界）
-    const AVATAR_III_RE   = /\bAvatar\s+III\b/i;
+    // 菜单文本会把选项名和描述无空格拼接（英文界面如 "Avatar IVGeneric motion…"），
+    // 故尾部禁用 \b 词边界——英文字母紧跟罗马数字时 \b 不成立，会导致 III/IV/V 全部匹配失败
+    // （中文描述是非词字符，天然有边界，所以旧写法只在英文界面炸）。去掉尾部 \b 对 {III,IV,V}
+    // 仍能正确区分：III 匹配整串 III、V 靠前导 "\bAvatar\s+" 不会误命中 "Avatar IV" 里的 V。
+    const AVATAR_IV_RE    = /\bAvatar\s+IV/i;
+    const AVATAR_V_RE     = /\bAvatar\s+V/i;   // "Avatar IV" 不会误命中（V 前须紧跟空白）
+    const AVATAR_III_RE   = /\bAvatar\s+III/i;
 
     let engineSwitching   = false;  // 再入保护：切换期间暂停 observer 触发
     let engineDebounce    = null;
@@ -7444,23 +7448,69 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         fire('pointerdown'); fire('pointerup'); el.click();
     }
 
+    // 可见性判断：Radix 弹层常挂在 position:fixed 的 portal 里（offsetParent 为 null），
+    // 故用 rect 尺寸判断可见，而非 offsetParent。
+    const isEngVis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+
     // 定位需要降级的引擎按钮：当前为 Avatar IV 或 Avatar V（AI Studio 多场景时逐个处理）
     function findDowngradeButton() {
-        return [...document.querySelectorAll('button')].find(b => {
+        const cands = [...document.querySelectorAll('button')].filter(b => {
             if (isHvtUI(b)) return false;
             const t = (b.textContent || '').trim().replace(/\s+/g, ' ');
-            return ENGINE_EXACT_RE.test(t) && (AVATAR_IV_RE.test(t) || AVATAR_V_RE.test(t));
+            return ENGINE_EXACT_RE.test(t) && (AVATAR_IV_RE.test(t) || AVATAR_V_RE.test(t)) && isEngVis(b);
         });
+        // 真正的引擎下拉触发器带 aria-haspopup="menu"；优先它，排除同名文本的诱饵按钮
+        // （Avatar Shots/预设行里可能有含 "Avatar V" 文本但不打开下拉的按钮）
+        return cands.find(b => b.getAttribute('aria-haspopup') === 'menu') || cands[0] || null;
     }
 
     function findEnginePopup() {
-        const sel = '[role="menu"],[role="listbox"],[data-radix-popper-content-wrapper],[role="dialog"][data-state="open"],[data-radix-menu-content],body > div';
+        // 只认真正的弹层容器。禁止 `body > div`——它会匹配整块页面容器：只要页面里
+        // 同时存在"Avatar IV"（当前引擎按钮）和"Avatar III"（历史视频卡片等诱饵文本），
+        // 就会误把页面当成下拉，进而在页面里标记到非交互的诱饵元素（v1.20.8 根因）。
+        const sel = '[role="menu"],[role="listbox"],[data-radix-popper-content-wrapper],[role="dialog"][data-state="open"],[data-radix-menu-content]';
         const candidates = [...document.querySelectorAll(sel)]
-            .filter(el => !isHvtUI(el) && el.offsetParent !== null)
+            .filter(el => !isHvtUI(el) && isEngVis(el))
             .map(el => ({ el, text: (el.textContent || '').replace(/\s+/g, ' ').trim() }))
             .filter(x => AVATAR_III_RE.test(x.text) && (AVATAR_IV_RE.test(x.text) || AVATAR_V_RE.test(x.text)))
             .sort((a, b) => a.text.length - b.text.length);
         return candidates[0]?.el || null;
+    }
+
+    // 打开下拉失败时输出的诊断信息，便于定位页面差异（如 Avatar Shots）
+    function engineDebugInfo(btn) {
+        const menus = [...document.querySelectorAll('[role="menu"],[data-radix-menu-content],[role="listbox"]')]
+            .filter(el => !isHvtUI(el))
+            .map(el => {
+                const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                return { role: el.getAttribute('role'), visible: isEngVis(el), hasIII: AVATAR_III_RE.test(t), hasIV: AVATAR_IV_RE.test(t), hasV: AVATAR_V_RE.test(t), text: t.slice(0, 220) };
+            });
+        return {
+            btnText: btn ? (btn.textContent || '').replace(/\s+/g, ' ').trim() : null,
+            haspopup: btn && btn.getAttribute('aria-haspopup'),
+            expanded: btn && btn.getAttribute('aria-expanded'),
+            state: btn && btn.getAttribute('data-state'),
+            btnVisible: btn ? isEngVis(btn) : null,
+            url: location.pathname,
+            visibleMenus: menus,
+        };
+    }
+
+    // 选中 Avatar III 后仍未生效时的诊断：桥接前后引擎值、是否有确认弹框、残留按钮
+    function engineSelectDebugInfo(bridgeSel) {
+        const dialogs = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')]
+            .filter(el => !isHvtUI(el) && isEngVis(el))
+            .map(el => ({
+                text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+                buttons: [...el.querySelectorAll('button')].map(b => (b.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 8),
+            }));
+        const stillBtn = findDowngradeButton();
+        return {
+            bridge: bridgeSel,                                  // {success, before, after, tried}
+            stillDowngradeBtn: stillBtn ? (stillBtn.textContent || '').replace(/\s+/g, ' ').trim() : null,
+            openMenus: [...document.querySelectorAll('[role="menu"]')].filter(el => !isHvtUI(el) && isEngVis(el)).map(el => (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60)),
+            dialogs,
+        };
     }
 
     // 点击引擎按钮后，等待含 Avatar III/IV/V 文本的下拉弹层出现
@@ -7482,14 +7532,16 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             return clickable && popup.contains(clickable) ? clickable : el;
         };
         const candidates = [popup, ...popup.querySelectorAll('[role="menuitem"],[role="option"],[role="menuitemradio"],[data-radix-collection-item],button,li,a,div,span')]
-            .filter(el => !isHvtUI(el) && el.offsetParent !== null)
+            .filter(el => !isHvtUI(el) && isEngVis(el))
             .map(el => ({ el, text: (el.textContent || '').replace(/\s+/g, ' ').trim() }))
             .filter(x => AVATAR_III_RE.test(x.text) && !AVATAR_IV_RE.test(x.text) && !AVATAR_V_RE.test(x.text))
             .sort((a, b) => a.text.length - b.text.length);
         return candidates[0] ? clickableOption(candidates[0].el) : null;
     }
 
-    function engineBridgeForceIII() {
+    // 在“已由 content.js 打开的引擎下拉”中选中 Avatar III：合成点击对 Radix 菜单项
+    // 不生效，交给 MAIN world 桥接调该项的 React onClick。
+    function engineBridgeSelectIII() {
         return new Promise(resolve => {
             const handler = (e) => {
                 document.removeEventListener('hvt-engine-result', handler);
@@ -7501,7 +7553,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 resolve({ success: false, error: 'timeout' });
             }, 4000);
             document.addEventListener('hvt-engine-result', handler);
-            document.dispatchEvent(new CustomEvent('hvt-engine-force-iii'));
+            document.dispatchEvent(new CustomEvent('hvt-engine-select-iii'));
         });
     }
 
@@ -7518,25 +7570,22 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
 
         engineSwitching = true;
         try {
-            const bridgeResult = await engineBridgeForceIII();
-            if (bridgeResult.success || !findDowngradeButton()) {
-                engineAttempts = 0;
-                console.log('[hvt] 动作引擎已通过 MAIN world 切回 Avatar III');
-                showToast('已自动将引擎切回 Avatar III', 'success', 2000);
-                return true;
-            }
-
+            // 1) 打开引擎下拉。合成 pointerClick 打开 Radix 触发器已实测可靠，但会 toggle：
+            //    仅在“菜单尚未打开”时点一次，避免把已开的菜单又关掉（旧版桥接+补点导致的
+            //    奇偶翻转正是间歇性“下拉未出现”的根因）。
             let popup = findEnginePopup();
             if (!popup) {
-                pointerClick(btn);                             // Radix 菜单需 pointerdown 才会打开
+                if (btn.getAttribute('aria-expanded') !== 'true') pointerClick(btn);
                 popup = await waitForEnginePopup();
             }
             if (!popup) {
                 engineAttempts++; engineCooldownUntil = Date.now() + 3000;
                 console.warn('[hvt] 引擎下拉未出现，跳过（第 ' + engineAttempts + ' 次）');
+                console.warn('[hvt] 引擎下拉诊断:', JSON.stringify(engineDebugInfo(btn)));
                 if (manual) showToast('未能打开 Avatar 引擎下拉，请再试一次', 'error', 2500);
                 return false;
             }
+            // 2) 确认 Avatar III 选项已渲染
             const opt = findAvatarIIIOption(popup);
             if (!opt) {
                 engineAttempts++; engineCooldownUntil = Date.now() + 3000;
@@ -7545,16 +7594,24 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                 if (manual) showToast('下拉中未找到 Avatar III 选项', 'error', 2500);
                 return false;
             }
-            pointerClick(opt);
+            // 3) 选中：content.js 已在开着的菜单里定位到 opt（选择器含 div/span，能覆盖
+            //    Avatar Shots 等非 role=menuitem 的菜单项）。给它打标记交桥接直接激活其
+            //    React onClick——避免桥接用更窄的 role 选择器重新查找导致 no-avatar-iii-item。
+            opt.setAttribute('data-hvt-eng-iii', '1');
+            const bridgeSel = await engineBridgeSelectIII();
+            opt.removeAttribute('data-hvt-eng-iii');
             await new Promise(r => setTimeout(r, 500));
-            if (findDowngradeButton()) {                        // 校验：仍为 IV/V → 记失败并退避
+            // 4) 校验：仍为 IV/V → 记失败并退避
+            if (findDowngradeButton()) {
                 engineAttempts++; engineCooldownUntil = Date.now() + 3000;
-                console.warn('[hvt] 点击后仍为 Avatar IV/V（第 ' + engineAttempts + ' 次），可能存在确认步骤');
+                console.warn('[hvt] 选中后仍为 Avatar IV/V（第 ' + engineAttempts + ' 次），可能存在确认步骤');
+                console.warn('[hvt] 引擎选中诊断:', JSON.stringify(engineSelectDebugInfo(bridgeSel)));
+                document.body.click();                          // 关闭可能残留的下拉
                 if (manual) showToast('点击后仍未切到 Avatar III，请检查是否有确认步骤', 'error', 2800);
                 return false;
             } else {
                 engineAttempts = 0;
-                console.log('[hvt] 动作引擎已从 Avatar IV/V 自动切回 Avatar III');
+                console.log('[hvt] 动作引擎已切回 Avatar III');
                 showToast('已自动将引擎切回 Avatar III', 'success', 2000);
                 return true;
             }

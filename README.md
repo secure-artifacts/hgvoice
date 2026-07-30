@@ -192,6 +192,14 @@
 
 ## 版本记录
 
+### v1.20.8
+- **彻底修复"换回 Avatar III 引擎"在各页面（尤其 Avatar Shots）失败/间歇失败**。本次修掉了这条链路上多个叠加的根因：
+  - **打开下拉的奇偶翻转**：改为职责拆分——content.js 只负责打开下拉（合成 pointerClick，且仅在菜单未开时点一次，绝不重复 toggle），桥接只负责在已打开的菜单里选中 III；不再由桥接对触发按钮过度灌事件。
+  - **英文界面识别不到菜单**：引擎正则尾部的 `\b` 词边界在"选项名+英文描述无空格拼接"（如 `Avatar IVGeneric…`）时失效，导致 III/IV/V 全部匹配失败。去掉尾部 `\b`（仍能正确区分）。
+  - **选中不生效**：Avatar Shots 的菜单项不是标准 Radix `menuitem`。改为由 content.js 定位并打标记、桥接直接激活该元素，并在调 React onClick 之外补一套会冒泡的原生指针序列（经 React 事件委托触发），覆盖不同页面的菜单实现。
+  - **误标记页面诱饵**：`findEnginePopup` 选择器里的 `body > div` 会把含 "Avatar IV/III" 文本的整块页面容器（含历史视频卡片诱饵）误当下拉。删除 `body > div`，只认真正弹层。
+  - 其余：`findDowngradeButton` 只认可见且带 `aria-haspopup="menu"` 的真触发器；弹层可见性判断改用 rect 尺寸（兼容 `position:fixed` portal）。
+
 ### v1.20.0
 - **换声音/引擎降级不再依赖写死的页面路由**：此前靠 `/avatar/`、`/create-v4/` 路径白名单判断"当前页面能不能用"，HeyGen 改版换路由就会误判成不可用（语音按钮明明在页面上却提示"请到 XX 页面"）。改为**探测页面上真实的入口控件**（Avatar Shots 的 `#audio` 语音按钮 / My Avatars 下拉 / AI Studio 语音行 / Switch 按钮 / Avatar IV·V 引擎按钮），路由与样式改版都不再影响可用性判断
 - **无入口时给一键跳转**：不在编辑器页面（如首页）打开换声音面板时，直接显示「→ 打开 Avatar Shots 编辑器」按钮，一键跳到自带语音控件的编辑器，解决"用户不知道编辑器链接、切不过去"的问题
