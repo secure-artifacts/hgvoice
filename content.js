@@ -4542,6 +4542,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     let bpRunning      = false;
     let bpCurrentTask  = null;   // 正在执行链路的任务 id（防重入）
     let bpPreflighting = false;  // 预审阶段进行中（防重入）
+    let bpStarting     = false;  // bpStart 正在等用户确认（过期定时提示）中，防重复弹框
     let bpHasLock      = false;  // 跨标签页单实例锁：仅持锁标签才提交/轮询
 
     // 单标签页选主：多个 HeyGen 标签页只允许一个真正提交渲染 + 轮询，
@@ -4970,11 +4971,49 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         const cutoff = Date.now() - 3600_000;
         return bpDb.tasks.filter(t => t.submittedAt && t.submittedAt > cutoff).length;
     }
+    // setTimeout 延迟上限 2^31-1 ms（≈24.8 天），超过会立刻触发 → 分段重排，
+    // 由 bpWorkerTick 的闸门每轮重新计算剩余时间。
+    const BP_MAX_TIMEOUT = 2147483647;
+
     function bpScheduleDelayMs() {
         const at = bpDb.settings.scheduleAt;
         if (!at) return 0;
         const ts = new Date(at).getTime();
         return Number.isFinite(ts) ? Math.max(0, ts - Date.now()) : 0;
+    }
+    // 定时已设且时间已过：到点时页面没开着，或是上一轮用完没清掉的残留。
+    function bpSchedulePast() {
+        const at = bpDb.settings.scheduleAt;
+        if (!at) return false;
+        const ts = new Date(at).getTime();
+        return Number.isFinite(ts) && ts <= Date.now();
+    }
+    // 定时是一次性的：兑现后立即清除。此前从不清除，导致昨天设的时间今天还留在框里，
+    // 用户点「开始」时摘要仍显示「定时 …」、实际却立刻开跑（实测复现）。
+    function bpConsumeSchedule() {
+        if (!bpDb.settings.scheduleAt) return;
+        bpDb.settings.scheduleAt = '';
+        bpSaveDb();
+        const el = document.getElementById('hvt-bp-schedule');
+        if (el) el.value = '';
+        bpSyncFoldSummaries();
+    }
+    // 运行中改定时后，让状态行立刻反映新定时。
+    // 只在 worker 确定空闲时才碰 bpWorkerTimer：预审中 bpPreflighting 为真、提交中
+    // bpCurrentTask 非空，这两个 await 之外的代码都是同步的，不存在「两标志都为假但
+    // worker 仍在途」的时刻，因此此时清定时器不会留下孤儿。
+    // 在途时一律不动定时器——外部装的定时器会被 worker 收尾时的赋值覆盖成孤儿，
+    // 孤儿到点仍会触发一次并发 tick，可能重复提交。改由闸门在下一轮兑现。
+    function bpRearmSchedule() {
+        const at = bpDb.settings.scheduleAt;
+        if (bpPreflighting || bpCurrentTask) {
+            bpSetStatusLine(at
+                ? `定时已改为 ${at.replace('T', ' ')}，当前任务完成后生效`
+                : '定时已取消，当前任务完成后按原节奏继续');
+            return;
+        }
+        if (bpWorkerTimer) { clearTimeout(bpWorkerTimer); bpWorkerTimer = null; }
+        bpWorkerTimer = setTimeout(bpWorkerTick, 50);   // 走一轮 tick，由闸门决定等还是跑
     }
     function bpRandomIntervalMs() {
         let lo = Math.max(0, Number(bpDb.settings.intervalMin) || 0);
@@ -4990,6 +5029,19 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
     async function bpWorkerTick() {
         bpWorkerTimer = null;
         if (!bpRunning || bpPreflighting) return;
+
+        // 阶段⓪ — 定时闸门：没到点就重排，不做任何提交。
+        // 必须放在 tick 内部、由 worker 独占写 bpWorkerTimer，理由见 bpRearmSchedule
+        // 的注释（外部改定时器会产生孤儿定时器 → 并发 tick → 重复提交）。
+        // 放这里还有个好处：初次启动、预审完、每条提交完、页面重载续跑，全都会经过
+        // 同一道闸门，运行中新设的定时因此天然生效，不必在别处各自判一遍。
+        const holdMs = bpScheduleDelayMs();
+        if (holdMs > 0) {
+            bpSetStatusLine(`定时启动：${new Date(Date.now() + holdMs).toLocaleString()}`);
+            bpWorkerTimer = setTimeout(bpWorkerTick, Math.min(holdMs, BP_MAX_TIMEOUT));
+            return;
+        }
+        bpConsumeSchedule();   // 已到点 → 兑现并清除，避免残留成下次的"假定时"
 
         // 阶段①：有「待提交」（待上传）或「审核中」任务 → 先跑预审（建组+追加+等审核）
         if (bpDb.tasks.some(t => t.status === '待提交' || t.status === '审核中')) {
@@ -5026,12 +5078,36 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         bpWorkerTimer = setTimeout(bpWorkerTick, wait);
     }
 
-    function bpStart() {
-        if (bpRunning) return;
+    async function bpStart() {
+        if (bpRunning || bpStarting) return;
         if (!bpHasLock) {
             bpSetStatusLine('另一个 HeyGen 标签页正在运行批量，请在该标签页操作，或关闭它后重试');
             showToast('已有 HeyGen 标签页在运行批量，请勿多开', 'error', 3500);
             return;
+        }
+        // 定时时间已过 → 到点时页面没开着（定时靠本页 setTimeout，标签页关掉就没了），
+        // 或是上次残留的时间。此前会静默把整批立刻提交出去，与用户设定时的本意相反。
+        // 现在显式确认，让用户能选择取消并重设。
+        if (bpSchedulePast()) {
+            const at = bpDb.settings.scheduleAt.replace('T', ' ');
+            const n = bpDb.tasks.filter(t => ['待提交', '已暂停', '审核中', '待渲染'].includes(t.status)).length;
+            bpStarting = true;
+            let go = false;
+            try {
+                go = await bpAsk('定时时间已过',
+                    `定时启动时间 ${at} 已经过去（到点时本页可能没开着）。继续将立即开始提交 ${n} 个待处理任务。`,
+                    '立即开始', '取消');
+            } finally { bpStarting = false; }
+            if (!go) {
+                // 落盘为「未运行」：此处也可能是从 bpInit 的续跑路径进来的，
+                // 不落盘会造成 localStorage 仍是 running=true，下次加载又弹一次。
+                bpDb.running = false;
+                bpSaveDb();
+                bpUpdateRunButtons();
+                bpSetStatusLine(`已取消：定时 ${at} 已过，请重设定时后再开始`);
+                return;
+            }
+            bpConsumeSchedule();
         }
         // 点「开始/继续提交」是明确的提交意图 → 「已暂停」任务全部恢复为待提交
         const paused = bpDb.tasks.filter(t => t.status === '已暂停');
@@ -5048,13 +5124,10 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         bpUpdateRunButtons();
         // 归档在两条导入路径里已各自生成过，这里不再重复触发（会额外产生一批下载条目）；
         // 需要重出归档用面板的「归档」按钮。
-        const delay = bpScheduleDelayMs();
-        if (delay > 0) {
-            bpSetStatusLine(`定时启动：${new Date(Date.now() + delay).toLocaleString()}`);
-            bpWorkerTimer = setTimeout(bpWorkerTick, delay);
-        } else {
-            bpWorkerTimer = setTimeout(bpWorkerTick, 50);
-        }
+        // 定时不在这里判断了——统一由 bpWorkerTick 的闸门处理，这样"运行中新设定时"
+        // 也能生效（此前定时只在 bpStart 读一次，而 bpStart 遇 bpRunning 直接 return，
+        // 导致运行中设的定时永远不生效，摘要却显示已设置）。
+        bpWorkerTimer = setTimeout(bpWorkerTick, 50);
         bpEnsurePoller();
     }
     function bpStop() {
@@ -5621,27 +5694,36 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         return url;
     }
     // 导入时若流水线在跑：新批次默认置「已暂停」，弹框问用户是立刻放行还是先核对
-    function bpAskJoinNow(n) {
+    // 通用确认框。挂 body 而非 #hvt-root：后者 pointer-events:none 会让按钮点不动，
+    // 且最小化面板时 display:none 会带走弹框。文案一律用 textContent 写入，不拼 HTML。
+    function bpAsk(title, body, okText, cancelText) {
         return new Promise(resolve => {
-            // 挂 body 而非 #hvt-root：后者 pointer-events:none 会让按钮点不动，且最小化面板时 display:none 会带走弹框
-            const host = document.body;
             const box = document.createElement('div');
             box.className = 'hvt-bp-ask';
             box.innerHTML = `
               <div class="hvt-bp-ask-card">
-                <div class="hvt-bp-ask-title">已添加 ${n} 个任务</div>
-                <div class="hvt-bp-ask-body">流水线正在运行中。要立刻把这批任务加入提交队列，还是先核对图文配对再放行？</div>
+                <div class="hvt-bp-ask-title"></div>
+                <div class="hvt-bp-ask-body"></div>
                 <div class="hvt-bp-ask-btns">
-                  <button class="hvt-btn hvt-bp-ask-later">先检查，稍后加入</button>
-                  <button class="hvt-btn hvt-btn-primary hvt-bp-ask-now">立即加入队列</button>
+                  <button class="hvt-btn hvt-bp-ask-cancel"></button>
+                  <button class="hvt-btn hvt-btn-primary hvt-bp-ask-ok"></button>
                 </div>
               </div>`;
-            host.appendChild(box);
+            box.querySelector('.hvt-bp-ask-title').textContent  = title;
+            box.querySelector('.hvt-bp-ask-body').textContent   = body;
+            box.querySelector('.hvt-bp-ask-cancel').textContent = cancelText;
+            box.querySelector('.hvt-bp-ask-ok').textContent     = okText;
+            document.body.appendChild(box);
             const done = v => { box.remove(); resolve(v); };
-            box.querySelector('.hvt-bp-ask-now').onclick = () => done(true);
-            box.querySelector('.hvt-bp-ask-later').onclick = () => done(false);
-            box.onclick = e => { if (e.target === box) done(false); };   // 点遮罩 = 先检查（安全默认）
+            box.querySelector('.hvt-bp-ask-ok').onclick     = () => done(true);
+            box.querySelector('.hvt-bp-ask-cancel').onclick = () => done(false);
+            box.onclick = e => { if (e.target === box) done(false); };   // 点遮罩 = 取消（安全默认）
         });
+    }
+    function bpAskJoinNow(n) {
+        return bpAsk(`已添加 ${n} 个任务`,
+            '流水线正在运行中。要立刻把这批任务加入提交队列，还是先核对图文配对再放行？',
+            '立即加入队列', '先检查，稍后加入');
     }
     // 导入收尾：非运行中直接是「待提交」无需询问；运行中按用户选择放行或留在暂停
     async function bpAfterImport(batchId, n, extra = '') {
@@ -5884,6 +5966,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         inp.click();
     }
     function bpSyncSettingsFromUI() {
+        const schedBefore = bpDb.settings.scheduleAt;
         const g = (id) => document.getElementById(id);
         bpDb.settings.spaceId     = g('hvt-bp-space').value;
         bpDb.settings.groupName   = g('hvt-bp-gname').value.trim();
@@ -5902,6 +5985,9 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         bpDb.settings.autoBorrow  = g('hvt-bp-autoborrow').checked;
         bpSaveDb();
         bpSyncFoldSummaries();
+        // 运行中改定时：闸门会在下一轮 tick 兑现，这里只负责让状态行立刻反映出来，
+        // 免得用户以为没生效（此前是真的没生效）。在途任务不受影响。
+        if (bpRunning && bpDb.settings.scheduleAt !== schedBefore) bpRearmSchedule();
     }
     function bpFillSettingsUI() {
         const s = bpDb.settings;
