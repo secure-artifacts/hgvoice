@@ -4089,6 +4089,29 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         input.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
+    // 弹窗内已渲染的声音行数（用 #play-s 预览按钮计数，语言无关）。
+    function aisModalRowCount() {
+        const dialog = aisCurrentVoiceDialog();
+        return dialog ? dialog.querySelectorAll('svg use[href="#play-s"]').length : 0;
+    }
+
+    // 等列表真正发生变化再继续，取代固定 sleep。
+    // 实测（2026-07-31，198 条声音）：点「查看更多」真实加载 0.6–1.7s、均值 ~1.0s；
+    // 原实现每次死等 0.9s+2.5s=3.4s，10 次就白等 24s。
+    async function aisWaitRowsChange(baseline, timeoutMs = 3000) {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            await new Promise(r => setTimeout(r, 100));
+            const n = aisModalRowCount();
+            if (n !== baseline) return n;
+        }
+        return aisModalRowCount();
+    }
+
+    // 用弹窗自带的搜索框缩小列表。
+    // 注意：该搜索是服务端 voice.list?name_filter=，实测**不完整**——name_filter=John
+    // 对 4 条名字含 John 的声音返回 0 条，纯 ASCII 名的声音基本都搜不到（真实键盘输入
+    // 同样如此，不是合成事件的问题）。所以这里只能当加速手段，绝不能当唯一路径。
     async function aisSearchOpenModal(targetVoiceId, opts) {
         const dialog = aisCurrentVoiceDialog();
         if (!dialog) return { success: false };
@@ -4103,13 +4126,17 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             .filter(Boolean);
         const original = input.value || '';
         for (const term of [...new Set(terms)]) {
+            const before = aisModalRowCount();
             aisSetInputValue(input, term);
-            await new Promise(r => setTimeout(r, 900));
-            const result = await aisBridgeSwitchUntil(targetVoiceId, opts, 2500);
+            await aisWaitRowsChange(before, 2000);
+            const result = await aisBridgeSwitchUntil(targetVoiceId, opts, 1200);
             if (result.success) return result;
         }
+        // 搜不到时列表会被清空（实测 204 → 0 条）。不等它恢复就返回的话，
+        // 后面的「查看更多」展开要从 20 条重新翻，等于把这段浪费再放大一倍。
+        const beforeRestore = aisModalRowCount();
         aisSetInputValue(input, original);
-        await new Promise(r => setTimeout(r, 300));
+        await aisWaitRowsChange(beforeRestore, 2500);
         return { success: false };
     }
 
@@ -4122,17 +4149,25 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             .find(el => textRe.test((el.textContent || '').trim().replace(/\s+/g, ' '))) || null;
     }
 
-    async function aisExpandOpenModalUntilFound(targetVoiceId, opts) {
+    // 逐次点「查看更多」把原生分页展开（每页 20 条）。
+    // 每次只等列表真的长出新行，然后单发一次桥接尝试——桥接 scan() 实测仅 6ms，
+    // 行已渲染就一定扫得到，无需反复轮询。加总时长预算防病态空转。
+    async function aisExpandOpenModalUntilFound(targetVoiceId, opts, budgetMs = 30000) {
+        const start = Date.now();
         let last = { success: false };
         for (;;) {
+            if (Date.now() - start > budgetMs) break;
             const moreBtn = aisFindSeeMoreBtn();
             if (!moreBtn) break;
+            const before = aisModalRowCount();
             moreBtn.click();
-            await new Promise(r => setTimeout(r, 900));
-            last = await aisBridgeSwitchUntil(targetVoiceId, opts, 2500);
+            const after = await aisWaitRowsChange(before, 3000);
+            if (after === before) break;   // 点了却没新行 → 已到底或卡住，不再空转
+            last = await aisBridgeSwitch(targetVoiceId, opts);
             if (last.success) return last;
         }
-        return last;
+        // 全部展开后再给一次带重试的机会（应对最后一页 React 提交稍慢）
+        return last.success ? last : await aisBridgeSwitchUntil(targetVoiceId, opts, 1000);
     }
 
     async function aisQuickSwitch(targetVoiceId) {
@@ -4168,10 +4203,16 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                     if (switchInModal) { switchInModal.click(); opened = true; }
                 }
                 // 路径二 — My Avatars 详情页：顶部声音下拉 → 菜单「Switch voice」
+                // 该下拉是 Radix DropdownMenu：合成 el.click() **打不开**（2026-07-31 实测
+                // aria-expanded 恒为 false、菜单项为空，整条路径直接报「未找到声音入口」），
+                // 必须补 pointerdown/pointerup，即已有的 pointerClick()。
+                // 用 aria-expanded 守卫防止重复触发把刚打开的菜单又 toggle 关掉。
+                // 菜单项本身用普通 click 即可（实测能开弹窗），不必走 MAIN world。
                 if (!opened && menuBtn) {
-                    menuBtn.click();
-                    await new Promise(r => setTimeout(r, 350));
+                    if (menuBtn.getAttribute('aria-expanded') !== 'true') pointerClick(menuBtn);
+                    await new Promise(r => setTimeout(r, 400));
                     const switchItem = [...document.querySelectorAll('[role="menuitem"], [role="menu"] button')]
+                        .filter(el => !isHvtUI(el))
                         .find(isSwitchEl);
                     if (switchItem) { switchItem.click(); opened = true; }
                 }
@@ -4207,43 +4248,51 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
 
         setStatus('正在切换声音…');
 
-        // Prefer a real, rendered modal row (visibleOnly): safest, and avoids the
-        // "假成功" where a cached object is accepted without the voice actually changing.
-        // The native list is virtualized, so a valid voice may simply not be rendered
-        // (scrolled out / other tab / not surfaced by search) — for that case we fall
-        // back to the cached object below (visibleOnly:false), guarded by the
-        // confirm+close verification so a non-applying selection still reports failure.
-        const bridgeOpts = { visibleOnly: true };
-
-        // Try current (first) tab — bridge handles modal search internally if needed
-        let result = await aisBridgeSwitchUntil(targetVoiceId, bridgeOpts, 2000);
-        if (!result.success) result = await aisSearchOpenModal(targetVoiceId, bridgeOpts);
-        if (!result.success) result = await aisExpandOpenModalUntilFound(targetVoiceId, bridgeOpts);
-
-        // If not found, iterate the modal's tabs (我的语音 / HeyGen 库 / …).
-        // Tabs carry role="tab" (language-independent), so iterate them all.
-        if (!result.success) {
-            const tabs = [...document.querySelectorAll('[role="dialog"][data-state="open"] [role="tab"]')]
-                .filter(el => !isHvtUI(el));
-            for (const tab of tabs) {
-                if (tab.getAttribute('aria-selected') === 'true') continue;
-                tab.click();
-                await new Promise(r => setTimeout(r, 600));
-                result = await aisBridgeSwitchUntil(targetVoiceId, bridgeOpts, 3000);
-                if (!result.success) result = await aisSearchOpenModal(targetVoiceId, bridgeOpts);
-                if (!result.success) result = await aisExpandOpenModalUntilFound(targetVoiceId, bridgeOpts);
-                if (result.success) break;
-            }
+        // ── 快路径：本地缓存里有完整 voice 对象 → 直接复用弹窗捕获的 onSelect ──
+        // 依据（2026-07-31 Playwright 实测）：voice.list 返回的对象与弹窗内部 React
+        // fiber 上的 p.voice **字段完全一致**（各 37 个键，双向差集为空）——弹窗里的
+        // 就是同一个 API 对象，不存在"结构不同导致选中无效"。实测调用后确认按钮
+        // 由 disabled 变为可用，选择确实注册成功。
+        // 这条路径 ~1.5s；而慢路径在 198 条声音下实测要 47s（单 tab）到 130s+（跨 tab）。
+        // 正确性仍由下方「点确认 + 轮询等弹窗关闭」守住：没真正生效就报失败，
+        // 不会出现假成功（见 memory: ais-switch-cached-fallback-guarded，该校验禁止删除）。
+        let result = { success: false };
+        if (aisTargetVoiceObj(targetVoiceId)) {
+            result = await aisBridgeSwitchUntil(targetVoiceId, { visibleOnly: false }, 1500);
         }
 
-        // Last-resort fallback (restores pre-1.14 capability): the target is a valid
-        // voice whose row the virtualized native modal never rendered and no tab/search
-        // surfaced. Reuse the captured onSelect with the cached voice object. The
-        // confirm+close verification below still guards against a fake success: if the
-        // selection does not really change, the confirm button stays disabled and the
-        // dialog won't close, so we report failure instead of a false ✅.
+        // ── 慢路径兜底：缓存里没有这条声音，或快路径没成功 ──
+        // 顺序：可视行 → 弹窗搜索 → 展开分页 → 换 tab 重来。
+        // 注意弹窗搜索靠服务端 name_filter，实测会漏（John 系列返回 0 条），
+        // 所以它只是加速，找不到不代表声音不存在，必须继续往下走。
         if (!result.success) {
-            result = await aisBridgeSwitchUntil(targetVoiceId, { visibleOnly: false }, 1500);
+            const bridgeOpts = { visibleOnly: true };
+            result = await aisBridgeSwitchUntil(targetVoiceId, bridgeOpts, 2000);
+            if (!result.success) result = await aisSearchOpenModal(targetVoiceId, bridgeOpts);
+            if (!result.success) result = await aisExpandOpenModalUntilFound(targetVoiceId, bridgeOpts);
+
+            // If not found, iterate the modal's tabs (我的语音 / HeyGen 库 / …).
+            // Tabs carry role="tab" (language-independent), so iterate them all.
+            if (!result.success) {
+                const tabs = [...document.querySelectorAll('[role="dialog"][data-state="open"] [role="tab"]')]
+                    .filter(el => !isHvtUI(el));
+                for (const tab of tabs) {
+                    if (tab.getAttribute('aria-selected') === 'true') continue;
+                    tab.click();
+                    await new Promise(r => setTimeout(r, 600));
+                    result = await aisBridgeSwitchUntil(targetVoiceId, bridgeOpts, 3000);
+                    if (!result.success) result = await aisSearchOpenModal(targetVoiceId, bridgeOpts);
+                    if (!result.success) result = await aisExpandOpenModalUntilFound(targetVoiceId, bridgeOpts);
+                    if (result.success) break;
+                }
+            }
+
+            // 最后再试一次缓存对象直连：快路径可能只是因为弹窗刚打开、还没挂载出
+            // 任何声音行（bridge 尚未 capture 到 onSelect）才失败；走完慢路径后
+            // 行肯定已渲染，此时重试几乎零成本。
+            if (!result.success) {
+                result = await aisBridgeSwitchUntil(targetVoiceId, { visibleOnly: false }, 1500);
+            }
         }
 
         if (result.success) {
@@ -4268,7 +4317,10 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
             setStatus(`✅ 已切换到「${result.name}」`, 'success');
             showToast(`✅ 已切换到「${result.name}」`, 'success', 2500);
         } else {
-            setStatus(isAvatarShots ? '未在弹窗列表/搜索/分页中找到该声音，请确认 My voices 可搜索到它' : '未找到该声音（已搜索全部标签）', 'error');
+            // 注意：这里过去写的是 `isAvatarShots ? … : …`，但 v1.20.0 删掉 URL 白名单后
+            // 该变量已无任何定义，严格模式下读它会抛 ReferenceError——导致每次切换失败
+            // 都崩在这行，状态永远停在「正在切换声音…」，用户看不到失败原因。
+            setStatus('未找到该声音（已试缓存直连、弹窗搜索、分页展开与全部标签）', 'error');
         }
     }
 
@@ -4318,9 +4370,36 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         if (internal) return;
         // 本地缓存（mvVoices/spaceVoices）可能还没同步完（分享声音、其他 Space 的声音等），
         // 凑巧命中几条不代表已经找全——只要有关键字就顺带发起一次全量扫描兜底。
-        if (query) {
+        // 例外：查询本身就是某条缓存声音的完整 voice_id（用户直接粘 ID），
+        // 已经百分百确定是哪一条，再扫全量纯属浪费几十个串行请求。
+        const exactIdHit = results.some(v => (v.voice_id || '').toLowerCase() === query);
+        if (query && !exactIdHit) {
             aisFallbackSearch(query, myToken);
         }
+    }
+
+    // 把扫描/探测到的声音并入本地缓存，返回是否真的新增了条目。
+    function aisMergeFallbackHits(matched, ctx) {
+        let added = false;
+        if (ctx.id) {
+            const existing = new Set(spaceVoices.map(v => v.voice_id));
+            for (const v of matched) {
+                if (!v.voice_id || existing.has(v.voice_id)) continue;
+                v._space = ctx.id;
+                v._spaceName = ctx.name;
+                v._origin = classifyOrigin(v);
+                spaceVoices.push(v);
+                added = true;
+            }
+        } else {
+            const existing = new Set(mvVoices.map(v => v.voice_id));
+            for (const v of matched) {
+                if (!v.voice_id || existing.has(v.voice_id)) continue;
+                mvVoices.push(v);
+                added = true;
+            }
+        }
+        return added;
     }
 
     async function aisFallbackSearch(query, myToken) {
@@ -4334,6 +4413,23 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
         if (!spacesList.length) { try { await fetchSpaces(); } catch {} }
         const contexts = [{ id: null }, ...spacesList];
         for (const ctx of contexts) {
+            // 先用服务端 name_filter 探一次：命中的话几百毫秒就有结果，用户立刻看到。
+            // 但它**不完整**（实测 name_filter=John 对 4 条含 John 的声音返回 0，
+            // name_filter=Voice 漏掉 10 条），所以无论命中与否都必须继续下面的
+            // 全量分页扫描，绝不能在这里 return。
+            try {
+                if (aisFallbackToken !== myToken) return;
+                const probe = await heygenApi(
+                    '/v2/pacific/voice_clone/voice.list?page_size=50&name_filter=' + encodeURIComponent(query),
+                    ctx.id ? { headers: { 'x-space-id': ctx.id } } : {}
+                );
+                const hits = probe.data || probe.list || probe.voices || [];
+                if (hits.length && aisMergeFallbackHits(hits, ctx)) {
+                    const searchEl = document.getElementById('hvt-ais-search');
+                    aisSearchVoices(searchEl ? searchEl.value : query, true);
+                }
+            } catch {}
+
             let token = null;
             const seenPage = new Set();
             for (;;) {                                   // 不设上限，拉到 next_token 为空
@@ -4355,19 +4451,7 @@ I produce short AI avatar videos (under 1 minute each) for American English-spea
                     (v.voice_id || '').toLowerCase().includes(query) ||
                     (v.display_name || '').toLowerCase().includes(query)
                 );
-                if (matched.length > 0) {
-                    if (ctx.id) {
-                        const existing = new Set(spaceVoices.map(v => v.voice_id));
-                        for (const v of matched) {
-                            if (existing.has(v.voice_id)) continue;
-                            v._space = ctx.id; v._spaceName = ctx.name;
-                            v._origin = classifyOrigin(v);
-                            spaceVoices.push(v);
-                        }
-                    } else {
-                        const existing = new Set(mvVoices.map(v => v.voice_id));
-                        for (const v of matched) if (!existing.has(v.voice_id)) mvVoices.push(v);
-                    }
+                if (matched.length > 0 && aisMergeFallbackHits(matched, ctx)) {
                     // 增量刷新界面，但不中断扫描——同一上下文剩余分页、以及其他 Space
                     // 可能还有更多匹配，必须扫完才能确认"找全了"。
                     const searchEl = document.getElementById('hvt-ais-search');
